@@ -113,22 +113,6 @@ fn mix_tail(samples: &mut [f64], tail: &[f64], ramp: &mut Ramp) {
     }
 }
 
-/// Restricts a tempo ratio to the range keylock stays transparent over.
-///
-/// The stretch is only allowed to nudge the beat into line. A pair needing
-/// more than this is a different groove, not a stretched one, and is left to
-/// the plain crossfade.
-fn clamp_tempo_ratio(ratio: f64) -> f64 {
-    if !ratio.is_finite() || ratio <= 0.0 {
-        return 1.0;
-    }
-    ratio.clamp(1.0 - MAX_TEMPO_STRETCH, 1.0 + MAX_TEMPO_STRETCH)
-}
-
-/// Highest ratio keylock is treated as transparent at. Matches the range the
-/// transition planner is willing to plan inside.
-const MAX_TEMPO_STRETCH: f64 = 0.08;
-
 struct Outgoing {
     decoder: Decoder,
     normalisation_factor: f64,
@@ -3052,7 +3036,7 @@ mod tests {
 
     use super::{
         AudioPacket, AudioPacketPosition, CROSSFADE_MAX, Outgoing, Ramp, apply_fade_in,
-        clamp_tempo_ratio, crossfade_frames, mix_tail,
+        crossfade_frames, mix_tail,
     };
     use crate::decoder::{AudioDecoder, DecoderError, DecoderResult};
     use super::{LoadError, PlayerEvent, PlayerTrackLoader};
@@ -3208,14 +3192,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_ratio_near_one_is_clamped_to_the_stretch_limit() {
-        assert!((clamp_tempo_ratio(1.5) - 1.08).abs() < 1e-9);
-        assert!((clamp_tempo_ratio(0.5) - 0.92).abs() < 1e-9);
-        assert!((clamp_tempo_ratio(1.03) - 1.03).abs() < 1e-9);
-        assert_eq!(clamp_tempo_ratio(f64::NAN), 1.0);
-        assert_eq!(clamp_tempo_ratio(0.0), 1.0);
-    }
 
 }
 
