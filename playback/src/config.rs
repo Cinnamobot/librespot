@@ -113,6 +113,8 @@ pub struct PlayerConfig {
     /// Where to report the loaded track's normalisation factor, for a
     /// host that wants to undo it for a visualiser.
     pub normalisation_report: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// How long one track overlaps the next. `Duration::ZERO` disables it.
+    pub crossfade: Duration,
     pub normalisation_pregain_db: f64,
     pub normalisation_threshold_dbfs: f64,
     pub normalisation_attack_cf: f64,
@@ -138,6 +140,7 @@ impl Default for PlayerConfig {
             normalisation_type: NormalisationType::default(),
             normalisation_method: NormalisationMethod::default(),
             normalisation_report: None,
+            crossfade: Duration::ZERO,
             normalisation_pregain_db: 0.0,
             normalisation_threshold_dbfs: -2.0,
             normalisation_attack_cf: duration_to_coefficient(Duration::from_millis(5)),
