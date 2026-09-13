@@ -54,6 +54,32 @@ fn crossfade_frames(crossfade: Duration) -> u64 {
     u64::from(SAMPLE_RATE) * ms / 1000
 }
 
+/// Where a transition starts, and how long it runs.
+///
+/// The player can only see the outgoing track's position, so the incoming
+/// track's own offset is carried for the caller: a host that plans a
+/// beat-matched transition sets this just before loading, and seeks the
+/// loaded track to `fade_in_at` itself.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CrossfadePlan {
+    /// Overlap length in seconds.
+    pub duration: Duration,
+    /// Seconds from the end of the outgoing track where its fade starts.
+    pub fade_out_before_end: Duration,
+    /// Seconds into the incoming track where its fade starts.
+    pub fade_in_at: Duration,
+}
+
+impl CrossfadePlan {
+    fn clamped(self) -> Self {
+        Self {
+            duration: self.duration.min(CROSSFADE_MAX),
+            fade_out_before_end: self.fade_out_before_end.max(Duration::ZERO),
+            fade_in_at: self.fade_in_at.max(Duration::ZERO),
+        }
+    }
+}
+
 struct Ramp {
     left: u64,
     total: u64,
@@ -214,6 +240,7 @@ struct PlayerInternal {
     local_file_lookup: Arc<LocalFileLookup>,
 
     crossfade: Duration,
+    plan: Option<CrossfadePlan>,
     outgoing: Option<Outgoing>,
     fade_in: Option<Ramp>,
     adopting: Option<SpotifyUri>,
@@ -240,6 +267,7 @@ enum PlayerCommand {
     EmitVolumeChangedEvent(u16),
     SetAutoNormaliseAsAlbum(bool),
     SetCrossfade(Duration),
+    SetCrossfadePlan(Option<CrossfadePlan>),
     EmitSessionDisconnectedEvent {
         connection_id: String,
         user_name: String,
@@ -645,6 +673,7 @@ impl Player {
                 local_file_lookup: Arc::new(local_file_lookup),
 
                 crossfade: crossfade.min(CROSSFADE_MAX),
+                plan: None,
                 outgoing: None,
                 fade_in: None,
                 adopting: None,
@@ -743,6 +772,12 @@ impl Player {
 
     pub fn set_crossfade(&self, crossfade: Duration) {
         self.command(PlayerCommand::SetCrossfade(crossfade));
+    }
+
+    /// Overrides where the next transition starts, in the incoming track's
+    /// own terms. Cleared by the load that follows it.
+    pub fn set_crossfade_plan(&self, plan: Option<CrossfadePlan>) {
+        self.command(PlayerCommand::SetCrossfadePlan(plan));
     }
 
     pub fn emit_filter_explicit_content_changed_event(&self, filter: bool) {
@@ -1946,6 +1981,7 @@ impl PlayerInternal {
         self.outgoing = None;
         self.fade_in = None;
         self.adopting = None;
+        self.plan = None;
     }
 
     fn write_packet(&mut self, packet: AudioPacket) {
@@ -2065,10 +2101,16 @@ impl PlayerInternal {
             } => Duration::from_millis(u64::from(duration_ms.saturating_sub(*stream_position_ms))),
             _ => return,
         };
-        if remaining > crossfade || !matches!(self.preload, PlayerPreload::Ready { .. }) {
+        // A planned transition may be shorter than the configured crossfade,
+        // and may start later, so its own overlap governs when it fires.
+        let (start_within, duration) = match self.plan {
+            Some(plan) => (plan.fade_out_before_end.max(plan.duration), plan.duration),
+            None => (crossfade, crossfade),
+        };
+        if remaining > start_within || !matches!(self.preload, PlayerPreload::Ready { .. }) {
             return;
         }
-        self.begin_crossfade(crossfade);
+        self.begin_crossfade(duration);
     }
 
     fn begin_crossfade(&mut self, crossfade: Duration) {
@@ -2096,6 +2138,8 @@ impl PlayerInternal {
         };
         self.fade_in = Some(Ramp::new(frames));
         self.adopting = Some(next_track_id.clone());
+        // The plan describes one boundary: the transition it was made for.
+        self.plan = None;
         self.send_event(PlayerEvent::EndOfTrack {
             track_id,
             play_request_id,
@@ -2143,6 +2187,8 @@ impl PlayerInternal {
             self.state = PlayerState::Stopped;
             self.fade_in = Some(Ramp::new(frames));
         }
+        // A skip cuts the planned boundary short; it must not fire later.
+        self.plan = None;
     }
 
     fn is_adopting(&self, track_id: &SpotifyUri, position_ms: u32) -> bool {
@@ -2715,7 +2761,12 @@ impl PlayerInternal {
                 self.auto_normalise_as_album = setting
             }
 
-            PlayerCommand::SetCrossfade(crossfade) => self.crossfade = crossfade.min(CROSSFADE_MAX),
+            PlayerCommand::SetCrossfade(crossfade) => {
+                self.crossfade = crossfade.min(CROSSFADE_MAX)
+            }
+            PlayerCommand::SetCrossfadePlan(plan) => {
+                self.plan = plan.map(CrossfadePlan::clamped)
+            }
             PlayerCommand::EmitFilterExplicitContentChangedEvent(filter) => {
                 self.send_event(PlayerEvent::FilterExplicitContentChanged { filter });
 
@@ -2875,6 +2926,10 @@ impl fmt::Debug for PlayerCommand {
             PlayerCommand::SetCrossfade(crossfade) => {
                 f.debug_tuple("SetCrossfade").field(&crossfade).finish()
             }
+            PlayerCommand::SetCrossfadePlan(plan) => f
+                .debug_tuple("SetCrossfadePlan")
+                .field(&plan.as_ref().map(|plan| plan.duration))
+                .finish(),
             PlayerCommand::EmitFilterExplicitContentChangedEvent(filter) => f
                 .debug_tuple("EmitFilterExplicitContentChangedEvent")
                 .field(&filter)
@@ -3035,8 +3090,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AudioPacket, AudioPacketPosition, CROSSFADE_MAX, Outgoing, Ramp, apply_fade_in,
-        crossfade_frames, mix_tail,
+        AudioPacket, AudioPacketPosition, CROSSFADE_MAX, CrossfadePlan, Outgoing, Ramp,
+        apply_fade_in, crossfade_frames, mix_tail,
     };
     use crate::decoder::{AudioDecoder, DecoderError, DecoderResult};
     use super::{LoadError, PlayerEvent, PlayerTrackLoader};
@@ -3192,6 +3247,46 @@ mod tests {
         );
     }
 
+    /// A plan decides when its transition fires, independently of the
+    /// configured crossfade length: a short planned overlap must still wait
+    /// for its own lead-in rather than firing at the global setting.
+    #[test]
+    fn a_plan_sets_its_own_lead_in_and_length() {
+        let plan = CrossfadePlan {
+            duration: Duration::from_secs(3),
+            fade_out_before_end: Duration::from_secs(9),
+            fade_in_at: Duration::from_millis(500),
+        }
+        .clamped();
+        assert_eq!(plan.duration, Duration::from_secs(3));
+        // The trigger waits for the later of the two lead-ins.
+        let start_within = plan.fade_out_before_end.max(plan.duration);
+        assert_eq!(start_within, Duration::from_secs(9));
+        // ...and the overlap is the planned length, not the lead-in.
+        assert_eq!(plan.duration, Duration::from_secs(3));
+    }
 
+    #[test]
+    fn a_plan_is_capped_at_the_crossfade_maximum() {
+        let plan = CrossfadePlan {
+            duration: Duration::from_secs(60),
+            fade_out_before_end: Duration::from_secs(60),
+            fade_in_at: Duration::ZERO,
+        }
+        .clamped();
+        assert_eq!(plan.duration, CROSSFADE_MAX);
+    }
+
+    #[test]
+    fn a_plan_never_asks_for_a_negative_offset() {
+        let plan = CrossfadePlan {
+            duration: Duration::from_secs(2),
+            fade_out_before_end: Duration::ZERO,
+            fade_in_at: Duration::ZERO,
+        }
+        .clamped();
+        assert_eq!(plan.fade_out_before_end, Duration::ZERO);
+        assert_eq!(plan.fade_in_at, Duration::ZERO);
+    }
 }
 
