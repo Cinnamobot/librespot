@@ -118,6 +118,50 @@ impl Ramp {
     }
 }
 
+/// How much of the incoming track's opening to hand to a host that wants to
+/// plan a transition. Long enough for a tempo lock, short enough that the
+/// probe stays inside the preload's lead time.
+const INCOMING_PROBE_SECONDS: usize = 20;
+
+/// Audio read from a preloaded track's opening, for a host planning the
+/// transition into it.
+///
+/// The probe is taken by consuming the preloaded decoder and then seeking it
+/// back, so the track still plays from where it was prepared to start. A
+/// host that only needs the tempo can plan without its own decoder; one that
+/// needs a grid runs its own analysis over these samples.
+#[derive(Clone, Debug)]
+pub struct IncomingProbe {
+    /// Interleaved stereo at [`SAMPLE_RATE`].
+    pub samples: Vec<f32>,
+    /// Where the probes' samples begin, in track time.
+    pub position_ms: u32,
+}
+
+/// Reads up to [`INCOMING_PROBE_SECONDS`] from the decoder's current
+/// position and leaves the decoder where it found it.
+fn probe_incoming(loaded_track: &mut PlayerLoadedTrackData) -> Result<IncomingProbe, Error> {
+    let position_ms = loaded_track.stream_position_ms;
+    let wanted = INCOMING_PROBE_SECONDS * SAMPLES_PER_SECOND as usize;
+    let mut samples = Vec::with_capacity(wanted);
+    while samples.len() < wanted {
+        match loaded_track.decoder.next_packet() {
+            Ok(Some((_, AudioPacket::Samples(packet)))) => {
+                samples.extend(packet.iter().map(|sample| *sample as f32));
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) | Err(_) => break,
+        }
+    }
+    // Put the decoder back: the track has not started yet, so this is the
+    // seek it would otherwise have made on its first load.
+    loaded_track.stream_position_ms = loaded_track.decoder.seek(position_ms)?;
+    Ok(IncomingProbe {
+        samples,
+        position_ms,
+    })
+}
+
 fn apply_fade_in(samples: &mut [f64], ramp: &mut Ramp) {
     for frame in samples.chunks_mut(NUM_CHANNELS as usize) {
         let gain = ramp.in_gain();
@@ -311,6 +355,12 @@ pub enum PlayerEvent {
     // The player is preloading a track.
     Preloading {
         track_id: SpotifyUri,
+    },
+    /// The opening of the track being preloaded, so a host can plan the
+    /// transition into it. Arrives before [`PlayerEvent::Preloading`].
+    IncomingPreloaded {
+        track_id: SpotifyUri,
+        probe: IncomingProbe,
     },
     // The player is playing a track.
     // This event is issued at the start of playback of whenever the position must be communicated
@@ -1608,7 +1658,21 @@ impl Future for PlayerInternal {
             {
                 let track_id = track_id.clone();
                 match loader.as_mut().poll(cx) {
-                    Poll::Ready(Ok(loaded_track)) => {
+                    Poll::Ready(Ok(mut loaded_track)) => {
+                        // Read the opening while the decoder is here, so a
+                        // host can plan the transition into this track
+                        // without decoding it a second time.
+                        match probe_incoming(&mut loaded_track) {
+                            Ok(probe) => self.send_event(PlayerEvent::IncomingPreloaded {
+                                track_id: track_id.clone(),
+                                probe,
+                            }),
+                            Err(error) => {
+                                warn!("Unable to probe the preloaded track: {error}");
+                                self.preload = PlayerPreload::None;
+                                continue;
+                            }
+                        }
                         self.send_event(PlayerEvent::Preloading {
                             track_id: track_id.clone(),
                         });
@@ -2127,7 +2191,7 @@ impl PlayerInternal {
     }
 
     fn begin_crossfade(&mut self, crossfade: Duration) {
-        let (next_track_id, loaded_track) =
+        let (next_track_id, mut loaded_track) =
             match mem::replace(&mut self.preload, PlayerPreload::None) {
                 PlayerPreload::Ready {
                     track_id,
@@ -2138,6 +2202,21 @@ impl PlayerInternal {
                     return;
                 }
             };
+        // A planned transition names where in the incoming track its own bar
+        // starts. Starting there rather than at the top is what makes the
+        // two tracks land their beats together instead of one sliding under
+        // the other.
+        if let Some(plan) = &self.plan {
+            let target_ms = plan.fade_in_at.as_millis() as u32;
+            if target_ms != loaded_track.stream_position_ms {
+                match loaded_track.decoder.seek(target_ms) {
+                    Ok(position) => loaded_track.stream_position_ms = position,
+                    Err(error) => {
+                        warn!("Unable to start the incoming track on its downbeat: {error}");
+                    }
+                }
+            }
+        }
         let frames = crossfade_frames(crossfade);
         let (track_id, play_request_id) = match self.take_outgoing(frames) {
             Some(taken) => taken,
