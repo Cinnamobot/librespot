@@ -2099,7 +2099,10 @@ impl PlayerInternal {
                 stream_position_ms,
                 ..
             } => Duration::from_millis(u64::from(duration_ms.saturating_sub(*stream_position_ms))),
-            _ => return,
+            _ => {
+                debug!("crossfade: not playing");
+                return;
+            }
         };
         // A planned transition may be shorter than the configured crossfade,
         // and may start later, so its own overlap governs when it fires.
@@ -2107,9 +2110,19 @@ impl PlayerInternal {
             Some(plan) => (plan.fade_out_before_end.max(plan.duration), plan.duration),
             None => (crossfade, crossfade),
         };
-        if remaining > start_within || !matches!(self.preload, PlayerPreload::Ready { .. }) {
+        let ready = matches!(self.preload, PlayerPreload::Ready { .. });
+        if remaining > start_within || !ready {
+            debug!(
+                "crossfade: waiting, remaining {:.2}s, start within {:.2}s, preload ready {ready}",
+                remaining.as_secs_f64(),
+                start_within.as_secs_f64()
+            );
             return;
         }
+        debug!(
+            "crossfade: firing with {:.2}s overlap",
+            duration.as_secs_f64()
+        );
         self.begin_crossfade(duration);
     }
 
