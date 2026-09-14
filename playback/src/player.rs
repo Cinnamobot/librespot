@@ -589,7 +589,13 @@ impl Outgoing {
         } else {
             // A tail that cannot be keylocked is still a tail: play it as it
             // is rather than losing the transition.
-            match Deck::new(decoder, rate, normalisation_factor, frames) {
+            let started = Instant::now();
+            let built = Deck::new(decoder, rate, normalisation_factor, frames);
+            warn!(
+                "crossfade: building the keylocked deck took {} ms on the audio thread",
+                started.elapsed().as_millis()
+            );
+            match built {
                 Ok(deck) => Tail::Stretched(Box::new(deck)),
                 Err(decoder) => Tail::Plain(decoder),
             }
@@ -2622,6 +2628,7 @@ impl PlayerInternal {
     }
 
     fn begin_crossfade(&mut self, crossfade: Duration, rate: f64) {
+        let begun = Instant::now();
         let (next_track_id, mut loaded_track) =
             match mem::replace(&mut self.preload, PlayerPreload::None) {
                 PlayerPreload::Ready {
@@ -2670,6 +2677,10 @@ impl PlayerInternal {
         let play_request_id = self.play_request_id_generator.get();
         self.send_event(PlayerEvent::PlayRequestIdChanged { play_request_id });
         self.start_playback(next_track_id, play_request_id, *loaded_track, true);
+        warn!(
+            "crossfade: the whole handover took {} ms on the audio thread",
+            begun.elapsed().as_millis()
+        );
     }
 
     fn take_outgoing(&mut self, frames: u64, rate: f64) -> Option<(SpotifyUri, u64)> {
