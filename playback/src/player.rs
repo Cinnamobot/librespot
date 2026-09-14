@@ -177,28 +177,27 @@ pub struct IncomingProbe {
     pub position_ms: u32,
 }
 
-/// Reads up to [`INCOMING_PROBE_SECONDS`] from the decoder's current
-/// position and leaves the decoder where it found it.
-fn probe_incoming(loaded_track: &mut PlayerLoadedTrackData) -> Result<IncomingProbe, Error> {
-    let position_ms = loaded_track.stream_position_ms;
+/// Reads one step of the opening: at most [`PROBE_STEP_SAMPLES`] more
+/// samples, stopping early once the whole probe is in.
+///
+/// Returns whether another step is needed. Keeping each step short is the
+/// point: the caller runs this from the loop that also decodes the *playing*
+/// track, and a step that took longer than the sink's queue would be heard
+/// as a gap in the transition.
+fn probe_step(decoder: &mut Decoder, samples: &mut Vec<f32>) -> bool {
     let wanted = INCOMING_PROBE_SECONDS * SAMPLES_PER_SECOND as usize;
-    let mut samples = Vec::with_capacity(wanted);
-    while samples.len() < wanted {
-        match loaded_track.decoder.next_packet() {
+    let step_end = (samples.len() + PROBE_STEP_SAMPLES).min(wanted);
+    while samples.len() < step_end {
+        match decoder.next_packet() {
             Ok(Some((_, AudioPacket::Samples(packet)))) => {
                 samples.extend(packet.iter().map(|sample| *sample as f32));
             }
             Ok(Some(_)) => continue,
-            Ok(None) | Err(_) => break,
+            // The track ended inside the probe: that is the whole opening.
+            Ok(None) | Err(_) => return false,
         }
     }
-    // Put the decoder back: the track has not started yet, so this is the
-    // seek it would otherwise have made on its first load.
-    loaded_track.stream_position_ms = loaded_track.decoder.seek(position_ms)?;
-    Ok(IncomingProbe {
-        samples,
-        position_ms,
-    })
+    samples.len() < wanted
 }
 
 /// Frequency the bass swap splits at, in Hz.
@@ -1327,11 +1326,29 @@ enum PlayerPreload {
         track_id: SpotifyUri,
         loader: Pin<Box<dyn FusedFuture<Output = Result<PlayerLoadedTrackData, LoadError>> + Send>>,
     },
+    /// Reading the incoming track's opening a step at a time.
+    ///
+    /// The read has to happen before the track is handed over, but doing it
+    /// in one go stops the loop that decodes the *playing* track, and the
+    /// sink only holds about 200 ms of audio. A probe of a useful length
+    /// takes longer than that, so the queue ran dry and the transition was
+    /// heard as a gap. Stepping it keeps both moving.
+    Probing {
+        track_id: SpotifyUri,
+        loaded_track: Box<PlayerLoadedTrackData>,
+        samples: Vec<f32>,
+        /// Where the decoder started, so it can be put back there.
+        position_ms: u32,
+    },
     Ready {
         track_id: SpotifyUri,
         loaded_track: Box<PlayerLoadedTrackData>,
     },
 }
+
+/// Samples the probe reads per step. Small enough that a step is far
+/// shorter than the sink's queue, so the playing track is never starved.
+const PROBE_STEP_SAMPLES: usize = 16_384 * NUM_CHANNELS as usize;
 
 type Decoder = Box<dyn AudioDecoder + Send>;
 
@@ -2056,6 +2073,57 @@ impl Future for PlayerInternal {
                 }
             }
 
+            // Step the incoming track's probe along. One step per pass
+            // keeps this loop returning to decode the playing track, which
+            // is what stops the probe from being heard as a gap.
+            if let PlayerPreload::Probing { .. } = self.preload {
+                // Take it out, step it, put it back: the borrow of
+                // `self.preload` cannot be held across `send_event`.
+                let probing = mem::replace(&mut self.preload, PlayerPreload::None);
+                let PlayerPreload::Probing {
+                    track_id,
+                    mut loaded_track,
+                    mut samples,
+                    position_ms,
+                } = probing
+                else {
+                    unreachable!("just matched");
+                };
+                if probe_step(&mut loaded_track.decoder, &mut samples) {
+                    self.preload = PlayerPreload::Probing {
+                        track_id,
+                        loaded_track,
+                        samples,
+                        position_ms,
+                    };
+                } else {
+                    // Put the decoder back where the probe found it: the
+                    // track has not started, so this is the seek it would
+                    // otherwise have made when it loads.
+                    match loaded_track.decoder.seek(position_ms) {
+                        Ok(position) => loaded_track.stream_position_ms = position,
+                        Err(error) => {
+                            warn!("Unable to rewind the preloaded track: {error}");
+                            continue;
+                        }
+                    }
+                    self.send_event(PlayerEvent::IncomingPreloaded {
+                        track_id: track_id.clone(),
+                        probe: IncomingProbe {
+                            samples,
+                            position_ms,
+                        },
+                    });
+                    self.send_event(PlayerEvent::Preloading {
+                        track_id: track_id.clone(),
+                    });
+                    self.preload = PlayerPreload::Ready {
+                        track_id,
+                        loaded_track,
+                    };
+                }
+            }
+
             // handle pending preload requests.
             if let PlayerPreload::Loading {
                 ref mut loader,
@@ -2064,26 +2132,14 @@ impl Future for PlayerInternal {
             {
                 let track_id = track_id.clone();
                 match loader.as_mut().poll(cx) {
-                    Poll::Ready(Ok(mut loaded_track)) => {
-                        // Read the opening while the decoder is here, so a
-                        // host can plan the transition into this track
-                        // without decoding it a second time.
-                        match probe_incoming(&mut loaded_track) {
-                            Ok(probe) => self.send_event(PlayerEvent::IncomingPreloaded {
-                                track_id: track_id.clone(),
-                                probe,
-                            }),
-                            Err(error) => {
-                                warn!("Unable to probe the preloaded track: {error}");
-                                self.preload = PlayerPreload::None;
-                                continue;
-                            }
-                        }
-                        self.send_event(PlayerEvent::Preloading {
-                            track_id: track_id.clone(),
-                        });
-                        self.preload = PlayerPreload::Ready {
+                    Poll::Ready(Ok(loaded_track)) => {
+                        // The opening is read a step at a time from the main
+                        // loop below, so the track that is still playing is
+                        // not starved while it happens.
+                        self.preload = PlayerPreload::Probing {
                             track_id,
+                            position_ms: loaded_track.stream_position_ms,
+                            samples: Vec::new(),
                             loaded_track: Box::new(loaded_track),
                         };
                     }
@@ -3625,8 +3681,9 @@ mod tests {
 
     use super::{
         AudioPacket, AudioPacketPosition, BassShelf, BASS_SWAP_DEPTH_DB, BASS_SWAP_HZ,
-        CROSSFADE_MAX, CrossfadePlan, Deck, NUM_CHANNELS, Outgoing, Ramp, SAMPLE_RATE, Tail,
-        apply_fade_in, crossfade_frames, mix_tail, mix_tail_with_bass,
+        CROSSFADE_MAX, CrossfadePlan, Decoder, Deck, NUM_CHANNELS, Outgoing, PROBE_STEP_SAMPLES,
+        Ramp, SAMPLE_RATE, Tail, apply_fade_in, crossfade_frames, mix_tail, mix_tail_with_bass,
+        probe_step,
     };
     use crate::decoder::{AudioDecoder, DecoderError, DecoderResult};
     use super::{LoadError, PlayerEvent, PlayerTrackLoader};
@@ -3769,6 +3826,79 @@ mod tests {
             Box::new(StubDecoder { packets: vec![tone(220.0, 512)] });
         let mut outgoing = Outgoing::new(decoder, 1.0, 512, 1.0001);
         assert!(matches!(outgoing.tail, Tail::Plain(_)));
+    }
+
+    /// A decoder that hands out its audio in small packets, so a step can be
+    /// told apart by how much it consumed rather than by one big read.
+    struct DripDecoder {
+        packets: Vec<Vec<f64>>,
+    }
+
+    impl AudioDecoder for DripDecoder {
+        fn seek(&mut self, position_ms: u32) -> Result<u32, DecoderError> {
+            Ok(position_ms)
+        }
+
+        fn next_packet(&mut self) -> DecoderResult<Option<(AudioPacketPosition, AudioPacket)>> {
+            if self.packets.is_empty() {
+                return Ok(None);
+            }
+            let samples = self.packets.remove(0);
+            Ok(Some((
+                AudioPacketPosition {
+                    position_ms: 0,
+                    skipped: false,
+                },
+                AudioPacket::Samples(samples),
+            )))
+        }
+    }
+
+    /// The bug this covers: the whole probe used to be read in one pass from
+    /// the loop that also decodes the *playing* track. A 90-second probe took
+    /// longer than the sink's queue holds, so the queue ran dry and the
+    /// listener heard the transition as a gap (measured: 623 ms of silence).
+    ///
+    /// Each step must therefore be bounded by `PROBE_STEP_SAMPLES`, so the
+    /// loop gets back to the playing track promptly.
+    #[test]
+    fn a_probe_reads_a_bounded_step_at_a_time() {
+        let packet_frames = 2_048;
+        let packets: Vec<Vec<f64>> = (0..40).map(|_| tone(440.0, packet_frames)).collect();
+        let mut decoder: Decoder = Box::new(DripDecoder { packets });
+
+        let mut samples: Vec<f32> = Vec::new();
+        let mut steps = 0;
+        let mut last = 0usize;
+        while probe_step(&mut decoder, &mut samples) {
+            steps += 1;
+            // The bound is per step: no single pass may outlast the sink's
+            // queue, which is what keeps the playing track fed.
+            let gained = samples.len() - last;
+            last = samples.len();
+            assert!(
+                gained <= PROBE_STEP_SAMPLES,
+                "step {steps} read {gained} samples, past the {PROBE_STEP_SAMPLES} bound"
+            );
+            assert!(steps < 1_000, "the probe must terminate");
+        }
+        assert!(steps > 1, "a 90s probe cannot be one step");
+        assert!(!samples.is_empty(), "the probe read nothing");
+    }
+
+    /// A track shorter than the probe must end the read rather than spin.
+    #[test]
+    fn a_probe_stops_when_the_track_ends() {
+        let mut decoder: Decoder = Box::new(DripDecoder {
+            packets: vec![tone(440.0, 1_024)],
+        });
+        let mut samples: Vec<f32> = Vec::new();
+        let mut steps = 0;
+        while probe_step(&mut decoder, &mut samples) {
+            steps += 1;
+            assert!(steps < 10, "a spent track must end the probe");
+        }
+        assert!(!samples.is_empty(), "the opening was still read");
     }
 
     /// The two decks must sum to constant power across the whole overlap,
