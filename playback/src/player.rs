@@ -11,7 +11,7 @@ use std::{
     sync::Mutex,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
     thread,
@@ -39,6 +39,7 @@ use librespot_metadata::{audio::UniqueFields, track::Tracks};
 
 use symphonia::core::io::MediaSource;
 use symphonia::core::probe::Hint;
+use timestretch::engine::{Engine, EngineConfig, EngineController, EngineProcessor, EngineProfile};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{NUM_CHANNELS, SAMPLE_RATE, SAMPLES_PER_SECOND};
@@ -51,6 +52,22 @@ const PRELOAD_NEXT_TRACK_BEFORE_END_DURATION_MS: u32 = 30000;
 const CROSSFADE_PRELOAD_SLACK: Duration = Duration::from_secs(20);
 
 const CROSSFADE_MAX: Duration = Duration::from_secs(12);
+
+/// Smallest tempo difference worth keylocking. Below it the two grids stay
+/// together across an overlap on their own, and the stretch is not free.
+const STRETCH_MIN_RATIO_DIFF: f64 = 0.005;
+
+/// Source ring for the outgoing deck's keylock. The engine checks at build
+/// that this covers several callbacks at the fastest rate it supports.
+const STRETCH_RING_FRAMES: usize = 32_768;
+
+/// Frames the engine renders per call, and so the granularity the deck
+/// reads its output at.
+const STRETCH_BLOCK_FRAMES: usize = 1_024;
+
+/// Source fed beyond what the overlap strictly needs, covering the
+/// resampler's lookahead so the last output frame is real audio.
+const STRETCH_FEED_SLACK: u64 = 4_096;
 
 const CROSSFADE_TAIL_PACKET_FRAMES: usize = 1024;
 
@@ -73,6 +90,11 @@ pub struct CrossfadePlan {
     pub fade_out_before_end: Duration,
     /// Seconds into the incoming track where its fade starts.
     pub fade_in_at: Duration,
+    /// The rate the outgoing tail is played at, with its pitch held, so its
+    /// beats land where the incoming track's already are. It is the
+    /// incoming track's tempo over the outgoing one's: a slower outgoing
+    /// track is sped up. 1.0 leaves the outgoing track alone.
+    pub tempo_rate: f64,
 }
 
 impl CrossfadePlan {
@@ -81,6 +103,11 @@ impl CrossfadePlan {
             duration: self.duration.min(CROSSFADE_MAX),
             fade_out_before_end: self.fade_out_before_end.max(Duration::ZERO),
             fade_in_at: self.fade_in_at.max(Duration::ZERO),
+            tempo_rate: if self.tempo_rate.is_finite() {
+                self.tempo_rate
+            } else {
+                1.0
+            },
         }
     }
 }
@@ -290,6 +317,200 @@ fn mix_tail_with_bass(samples: &mut [f64], outgoing: &mut Outgoing) {
     }
 }
 
+/// Feeds one packet of `decoder` into `source`, stopping at `budget` frames.
+/// Returns whether anything was fed; `false` means the track ran out.
+fn feed_one(
+    decoder: &mut Decoder,
+    source: &mut timestretch::engine::SourceProducer,
+    scratch: &mut Vec<f32>,
+    factor: f64,
+    fed: &mut u64,
+    budget: u64,
+) -> bool {
+    let packet = match decoder.next_packet() {
+        Ok(Some((_, AudioPacket::Samples(samples)))) => samples,
+        Ok(Some(_)) => return true,
+        Ok(None) | Err(_) => return false,
+    };
+    scratch.clear();
+    scratch.extend(packet.iter().map(|sample| (sample * factor) as f32));
+    let mut written = 0;
+    while written < scratch.len() {
+        if *fed >= budget {
+            return true;
+        }
+        // `push` counts frames, the slice is interleaved samples: never step
+        // by the wrong one, or the feed hands the ring half a frame.
+        let accepted = source.push(&scratch[written..]);
+        if accepted == 0 {
+            return true;
+        }
+        written += accepted * NUM_CHANNELS as usize;
+        *fed += accepted as u64;
+    }
+    true
+}
+
+/// Plays the outgoing track's tail at a different tempo with its pitch
+/// held, so its beats line up with the incoming track's for the overlap.
+///
+/// The engine is fed from a thread of its own. Its contract is that the host
+/// keeps at least `demand_hint` frames buffered before every call, which
+/// means decoding ahead of the read, and the sink thread must never wait on
+/// a decode. Feeding less than that is not an error the engine reports: it
+/// emits silence for the shortfall, which would be a hole in the middle of
+/// the transition. So the feed stays ahead of the engine, and the ring's own
+/// backpressure paces it.
+///
+/// The mix's ramp decides how much is read, and it reaches zero exactly at
+/// the last frame of the overlap, so this deck never has to work out where
+/// the track ended: it renders what it is asked and the engine pads a track
+/// that ran out first.
+struct Deck {
+    processor: EngineProcessor,
+    /// Where the engine reports silence it had to substitute. Non-zero means
+    /// the feed fell behind, which is the one way this deck can fail without
+    /// sounding like anything in particular.
+    controller: EngineController,
+    /// Set on drop, so a feed parked on a full ring gives up.
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+    /// Rendered output not yet handed to the mix.
+    ready: VecDeque<f64>,
+    /// Render target, reused so a block costs no allocation.
+    out: Vec<f32>,
+    underruns: u64,
+}
+
+impl Deck {
+    /// Starts a keylocked deck to play `frames` of the tail at `rate`.
+    /// Hands the decoder back if the engine will not build, so the caller
+    /// can still play the tail as it is.
+    fn new(decoder: Decoder, rate: f64, factor: f64, frames: u64) -> Result<Self, Decoder> {
+        let handles = match Engine::build(EngineConfig {
+            sample_rate: SAMPLE_RATE,
+            channels: NUM_CHANNELS as usize,
+            profile: EngineProfile::Keylock,
+            initial_tempo_rate: rate,
+            max_block_frames: STRETCH_BLOCK_FRAMES,
+            source_capacity_frames: STRETCH_RING_FRAMES,
+            pre_analysis: None,
+        }) {
+            Ok(handles) => handles,
+            Err(e) => {
+                warn!("Unable to build the keylock engine, playing the tail as it is: {e}");
+                return Err(decoder);
+            }
+        };
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let mut source = handles.source;
+        // The engine takes source at `rate` frames per frame out, so this is
+        // how much of the track the overlap can reach. The rest of the track
+        // is left undecoded: a transition out of the outro must not pull in
+        // minutes of audio it will never play.
+        let budget = (frames as f64 * rate).ceil() as u64 + STRETCH_FEED_SLACK;
+
+        // Prime before returning. The engine substitutes silence for source
+        // it does not have yet, so a deck handed straight to the sink would
+        // open the transition with a gap while the feed thread catches up.
+        let mut decoder = decoder;
+        let mut fed = 0u64;
+        let mut scratch: Vec<f32> = Vec::new();
+        let prime = source.demand_hint(STRETCH_BLOCK_FRAMES, rate.max(1.0));
+        while source.occupied_frames() < prime && fed < budget && feed_one(
+            &mut decoder, &mut source, &mut scratch, factor, &mut fed, budget,
+        ) {}
+
+        let handle = thread::Builder::new()
+            .name("crossfade-stretch".into())
+            .spawn(move || {
+                'feed: while fed < budget {
+                    if worker_stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    match decoder.next_packet() {
+                        Ok(Some((_, AudioPacket::Samples(samples)))) => {
+                            scratch.clear();
+                            scratch.extend(samples.iter().map(|s| (s * factor) as f32));
+                            let mut written = 0;
+                            while written < scratch.len() {
+                                if worker_stop.load(Ordering::Acquire) {
+                                    return;
+                                }
+                                let accepted = source.push(&scratch[written..]);
+                                if accepted == 0 {
+                                    // The ring is full, so the engine is
+                                    // where it should be; let it catch up.
+                                    thread::yield_now();
+                                    continue;
+                                }
+                                written += accepted * NUM_CHANNELS as usize;
+                                fed += accepted as u64;
+                                if fed >= budget {
+                                    break 'feed;
+                                }
+                            }
+                        }
+                        Ok(Some(_)) => continue,
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+                // Padding so the resampler releases the last real frames.
+                loop {
+                    if source.finish() || worker_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    thread::yield_now();
+                }
+            })
+            .expect("spawning the crossfade stretch thread");
+
+        Ok(Self {
+            processor: handles.processor,
+            controller: handles.controller,
+            stop,
+            handle: Some(handle),
+            ready: VecDeque::new(),
+            out: vec![0.0; STRETCH_BLOCK_FRAMES * NUM_CHANNELS as usize],
+            underruns: 0,
+        })
+    }
+
+    /// The next `wanted` interleaved samples, already normalised.
+    fn take(&mut self, wanted: usize) -> Vec<f64> {
+        while self.ready.len() < wanted {
+            self.processor.process(&mut self.out);
+            self.ready
+                .extend(self.out.iter().map(|sample| f64::from(*sample)));
+            let underruns = self.controller.underrun_frames();
+            if underruns > self.underruns {
+                warn!(
+                    "The keylocked tail missed {} frames of source, so the transition has a gap",
+                    underruns - self.underruns
+                );
+                self.underruns = underruns;
+            }
+        }
+        let mut taken: Vec<f64> = self
+            .ready
+            .drain(..wanted.min(self.ready.len()))
+            .collect();
+        taken.resize(wanted, 0.0);
+        taken
+    }
+}
+
+impl Drop for Deck {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 fn mix_tail(samples: &mut [f64], tail: &[f64], ramp: &mut Ramp) {
     let channels = NUM_CHANNELS as usize;
     for (frame, tail_frame) in samples.chunks_mut(channels).zip(tail.chunks(channels)) {
@@ -301,8 +522,40 @@ fn mix_tail(samples: &mut [f64], tail: &[f64], ramp: &mut Ramp) {
     }
 }
 
+/// Where the outgoing deck's samples come from: the decoder as it was, or
+/// a keylocked deck playing the tail at the transition's rate.
+enum Tail {
+    Plain(Decoder),
+    Stretched(Box<Deck>),
+}
+
+impl Tail {
+    /// The next `wanted` interleaved samples, already normalised. `None`
+    /// once the track is behind this deck.
+    fn produce(&mut self, wanted: usize, factor: f64) -> Option<Vec<f64>> {
+        match self {
+            Self::Plain(decoder) => {
+                let mut out: Vec<f64> = Vec::new();
+                while out.len() < wanted {
+                    match decoder.next_packet() {
+                        Ok(Some((_, AudioPacket::Samples(samples)))) => {
+                            out.extend(samples.iter().map(|sample| sample * factor));
+                        }
+                        Ok(Some(_)) => continue,
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+                if out.is_empty() { None } else { Some(out) }
+            }
+            // The deck hands back silence once the track is behind it, so
+            // the ramp alone decides when the overlap is over.
+            Self::Stretched(deck) => Some(deck.take(wanted)),
+        }
+    }
+}
+
 struct Outgoing {
-    decoder: Decoder,
+    tail: Tail,
     normalisation_factor: f64,
     pending: VecDeque<f64>,
     ramp: Ramp,
@@ -320,13 +573,25 @@ struct Outgoing {
 }
 
 impl Outgoing {
-    fn new(decoder: Decoder, normalisation_factor: f64, frames: u64) -> Self {
+    fn new(decoder: Decoder, normalisation_factor: f64, frames: u64, rate: f64) -> Self {
         // The sweep runs over the first part of the overlap: the low end
         // leaves before the fade is half done, so the two basses never sit
         // together at equal level for long.
         let sweep = frames / 3;
+        // A rate this close to 1.0 is inaudible as a tempo difference, so
+        // the engine is not worth starting for it.
+        let tail = if (rate - 1.0).abs() < STRETCH_MIN_RATIO_DIFF {
+            Tail::Plain(decoder)
+        } else {
+            // A tail that cannot be keylocked is still a tail: play it as it
+            // is rather than losing the transition.
+            match Deck::new(decoder, rate, normalisation_factor, frames) {
+                Ok(deck) => Tail::Stretched(Box::new(deck)),
+                Err(decoder) => Tail::Plain(decoder),
+            }
+        };
         Self {
-            decoder,
+            tail,
             normalisation_factor,
             pending: VecDeque::new(),
             ramp: Ramp::new(frames),
@@ -343,17 +608,10 @@ impl Outgoing {
     fn take(&mut self, frames: usize) -> Vec<f64> {
         let wanted = frames * NUM_CHANNELS as usize;
         while self.pending.len() < wanted && !self.ended {
-            match self.decoder.next_packet() {
-                Ok(Some((_, AudioPacket::Samples(samples)))) => {
-                    let factor = self.normalisation_factor;
-                    self.pending
-                        .extend(samples.iter().map(|sample| sample * factor));
-                }
-                Ok(Some(_)) | Ok(None) => self.ended = true,
-                Err(e) => {
-                    warn!("Ending the crossfade, unable to decode the outgoing track: {e:?}");
-                    self.ended = true;
-                }
+            let factor = self.normalisation_factor;
+            match self.tail.produce(wanted - self.pending.len(), factor) {
+                Some(samples) => self.pending.extend(samples),
+                None => self.ended = true,
             }
         }
         let mut taken: Vec<f64> = self
@@ -2339,14 +2597,15 @@ impl PlayerInternal {
             );
             return;
         }
+        let rate = self.plan.map_or(1.0, |plan| plan.tempo_rate);
         debug!(
-            "crossfade: firing with {:.2}s overlap",
+            "crossfade: firing with {:.2}s overlap, outgoing tail at {rate:.4}x",
             duration.as_secs_f64()
         );
-        self.begin_crossfade(duration);
+        self.begin_crossfade(duration, rate);
     }
 
-    fn begin_crossfade(&mut self, crossfade: Duration) {
+    fn begin_crossfade(&mut self, crossfade: Duration, rate: f64) {
         let (next_track_id, mut loaded_track) =
             match mem::replace(&mut self.preload, PlayerPreload::None) {
                 PlayerPreload::Ready {
@@ -2374,7 +2633,7 @@ impl PlayerInternal {
             }
         }
         let frames = crossfade_frames(crossfade);
-        let (track_id, play_request_id) = match self.take_outgoing(frames) {
+        let (track_id, play_request_id) = match self.take_outgoing(frames, rate) {
             Some(taken) => taken,
             None => {
                 self.preload = PlayerPreload::Ready {
@@ -2397,7 +2656,7 @@ impl PlayerInternal {
         self.start_playback(next_track_id, play_request_id, *loaded_track, true);
     }
 
-    fn take_outgoing(&mut self, frames: u64) -> Option<(SpotifyUri, u64)> {
+    fn take_outgoing(&mut self, frames: u64, rate: f64) -> Option<(SpotifyUri, u64)> {
         match mem::replace(&mut self.state, PlayerState::Invalid) {
             PlayerState::Playing {
                 track_id,
@@ -2411,7 +2670,7 @@ impl PlayerInternal {
                 } else {
                     1.0
                 };
-                self.outgoing = Some(Outgoing::new(decoder, factor, frames));
+                self.outgoing = Some(Outgoing::new(decoder, factor, frames, rate));
                 Some((track_id, play_request_id))
             }
             other => {
@@ -2431,7 +2690,7 @@ impl PlayerInternal {
             return;
         }
         let frames = crossfade_frames(crossfade);
-        if self.take_outgoing(frames).is_some() {
+        if self.take_outgoing(frames, 1.0).is_some() {
             self.state = PlayerState::Stopped;
             self.fade_in = Some(Ramp::new(frames));
         }
@@ -3339,8 +3598,8 @@ mod tests {
 
     use super::{
         AudioPacket, AudioPacketPosition, BassShelf, BASS_SWAP_DEPTH_DB, BASS_SWAP_HZ,
-        CROSSFADE_MAX, CrossfadePlan, Outgoing, Ramp, apply_fade_in, crossfade_frames,
-        mix_tail, mix_tail_with_bass,
+        CROSSFADE_MAX, CrossfadePlan, Deck, NUM_CHANNELS, Outgoing, Ramp, SAMPLE_RATE, Tail,
+        apply_fade_in, crossfade_frames, mix_tail, mix_tail_with_bass,
     };
     use crate::decoder::{AudioDecoder, DecoderError, DecoderResult};
     use super::{LoadError, PlayerEvent, PlayerTrackLoader};
@@ -3397,6 +3656,92 @@ mod tests {
                 AudioPacket::Samples(samples),
             )))
         }
+    }
+
+    /// A tone at `hz`, as one packet of `frames` stereo frames.
+    fn tone(hz: f64, frames: usize) -> Vec<f64> {
+        let mut out = Vec::with_capacity(frames * NUM_CHANNELS as usize);
+        for frame in 0..frames {
+            let value = (2.0 * std::f64::consts::PI * hz * frame as f64 / f64::from(SAMPLE_RATE)).sin();
+            for _ in 0..NUM_CHANNELS {
+                out.push(value);
+            }
+        }
+        out
+    }
+
+    /// Counting zero crossings gives the tone's frequency, which is the whole
+    /// point of keylock: the deck plays the tail faster, so the same audio
+    /// arrives sooner, but the pitch the listener hears must not move.
+    fn dominant_frequency(samples: &[f64]) -> f64 {
+        let mono: Vec<f64> = samples.chunks(NUM_CHANNELS as usize).map(|f| f[0]).collect();
+        // Ignore the ends: the engine's stages settle over the first blocks.
+        let skip = (mono.len() / 4).max(1);
+        let body = &mono[skip..mono.len().saturating_sub(skip)];
+        let crossings = body
+            .windows(2)
+            .filter(|pair| (pair[0] < 0.0) != (pair[1] < 0.0))
+            .count();
+        crossings as f64 * f64::from(SAMPLE_RATE) / (2.0 * body.len() as f64)
+    }
+
+    /// The deck must hand back the overlap's worth of audio, at the requested
+    /// rate and with the pitch held. A deck that stretched the pitch along
+    /// with the tempo would be a tape deck, not a keylocked one.
+    #[test]
+    fn the_keylocked_tail_changes_tempo_and_keeps_pitch() {
+        let hz = 220.0;
+        // Enough audio that the stretched read stays inside the track: the
+        // overlap asks the engine for more source frames than it plays.
+        let frames = 16_384usize;
+        let overlap = 4_000u64;
+        let rate = 1.06;
+        let decoder: Box<dyn AudioDecoder + Send> = Box::new(StubDecoder {
+            packets: vec![tone(hz, frames)],
+        });
+        let mut deck = match Deck::new(decoder, rate, 1.0, overlap) {
+            Ok(deck) => deck,
+            Err(_) => panic!("the engine builds"),
+        };
+
+        // Read the overlap's worth, as the mix does across the ramp.
+        let wanted = overlap as usize * NUM_CHANNELS as usize;
+        let mut rendered: Vec<f64> = Vec::with_capacity(wanted);
+        while rendered.len() < wanted {
+            rendered.extend(deck.take(NUM_CHANNELS as usize * 256));
+        }
+        rendered.truncate(wanted);
+
+        let heard = dominant_frequency(&rendered);
+        assert!(
+            (heard - hz).abs() < 8.0,
+            "keylock moved the pitch: heard {heard:.1} Hz for a {hz:.0} Hz tone"
+        );
+        assert_eq!(
+            deck.controller.underrun_frames(),
+            0,
+            "the feed fell behind, leaving a gap in the overlap"
+        );
+        // Pitch alone would also hold if the deck played nothing at all, so
+        // check the tempo too. Measured by draining the engine, the rate is a
+        // speed: `rate` frames of track are consumed per second of output,
+        // so the overlap eats `overlap / rate` frames of it.
+        let consumed = deck.controller.source_position();
+        let expected = overlap as f64 / rate;
+        assert!(
+            (consumed - expected).abs() < 128.0,
+            "the tail did not play at {rate}x: consumed {consumed:.0} source frames for \
+             {overlap} output frames, expected about {expected:.0}"
+        );
+    }
+
+    /// A rate within a hair of 1.0 must not pay for the engine at all.
+    #[test]
+    fn a_tail_at_its_own_tempo_stays_unstretched() {
+        let decoder: Box<dyn AudioDecoder + Send> =
+            Box::new(StubDecoder { packets: vec![tone(220.0, 512)] });
+        let mut outgoing = Outgoing::new(decoder, 1.0, 512, 1.0001);
+        assert!(matches!(outgoing.tail, Tail::Plain(_)));
     }
 
     /// The two decks must sum to constant power across the whole overlap,
@@ -3495,7 +3840,7 @@ mod tests {
         let decoder: Box<dyn AudioDecoder + Send> = Box::new(StubDecoder {
             packets: vec![vec![0.3; total]],
         });
-        let mut outgoing = Outgoing::new(decoder, 1.0, frames);
+        let mut outgoing = Outgoing::new(decoder, 1.0, frames, 1.0);
         assert_eq!(
             outgoing.bass_left, outgoing.bass_total,
             "the sweep starts unengaged"
@@ -3602,7 +3947,7 @@ mod tests {
         let decoder = StubDecoder {
             packets: vec![vec![1.0; 6], vec![1.0; 2], vec![1.0; 10]],
         };
-        let mut outgoing = Outgoing::new(Box::new(decoder), 1.0, 100);
+        let mut outgoing = Outgoing::new(Box::new(decoder), 1.0, 100, 1.0);
         assert_eq!(outgoing.take(4).len(), 8);
         assert_eq!(outgoing.take(4).len(), 8);
     }
@@ -3612,7 +3957,7 @@ mod tests {
         let decoder = StubDecoder {
             packets: vec![vec![1.0; 4]],
         };
-        let mut outgoing = Outgoing::new(Box::new(decoder), 1.0, 100);
+        let mut outgoing = Outgoing::new(Box::new(decoder), 1.0, 100, 1.0);
         assert_eq!(
             outgoing.take(4),
             vec![1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
@@ -3625,7 +3970,7 @@ mod tests {
         let decoder = StubDecoder {
             packets: vec![vec![1.0; 4]],
         };
-        let mut outgoing = Outgoing::new(Box::new(decoder), 0.5, 100);
+        let mut outgoing = Outgoing::new(Box::new(decoder), 0.5, 100, 1.0);
         assert_eq!(outgoing.take(2), vec![0.5, 0.5, 0.5, 0.5]);
     }
 
@@ -3648,6 +3993,7 @@ mod tests {
             duration: Duration::from_secs(3),
             fade_out_before_end: Duration::from_secs(9),
             fade_in_at: Duration::from_millis(500),
+            tempo_rate: 1.0,
         }
         .clamped();
         assert_eq!(plan.duration, Duration::from_secs(3));
@@ -3664,6 +4010,7 @@ mod tests {
             duration: Duration::from_secs(60),
             fade_out_before_end: Duration::from_secs(60),
             fade_in_at: Duration::ZERO,
+            tempo_rate: 1.0,
         }
         .clamped();
         assert_eq!(plan.duration, CROSSFADE_MAX);
@@ -3675,6 +4022,7 @@ mod tests {
             duration: Duration::from_secs(2),
             fade_out_before_end: Duration::ZERO,
             fade_in_at: Duration::ZERO,
+            tempo_rate: 1.0,
         }
         .clamped();
         assert_eq!(plan.fade_out_before_end, Duration::ZERO);
