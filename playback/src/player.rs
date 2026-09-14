@@ -103,11 +103,14 @@ impl Ramp {
     }
 
     fn progress(&self) -> f64 {
-        if self.total == 0 {
-            1.0
-        } else {
-            1.0 - (self.left as f64 / self.total as f64)
+        // The first frame is the start and the last frame is the end, so the
+        // curve reaches exactly 0 and 1 rather than stopping short of them.
+        // Otherwise the incoming track never quite arrives at full level and
+        // the outgoing one is cut while still audible.
+        if self.total <= 1 || self.left == 0 {
+            return 1.0;
         }
+        (self.total - self.left) as f64 / (self.total - 1) as f64
     }
 
     fn out_gain(&self) -> f64 {
@@ -3267,6 +3270,59 @@ mod tests {
         }
     }
 
+    /// The two decks must sum to constant power across the whole overlap,
+    /// which is what stops the middle of a transition sounding dipped. This
+    /// checks the composite rather than either curve on its own, because a
+    /// ramp pair that is individually right can still be mismatched in
+    /// length and leave a hole.
+    #[test]
+    fn the_two_decks_hold_constant_power_across_the_overlap() {
+        let frames = 1000u64;
+        let mut out = Ramp::new(frames);
+        let mut incoming = Ramp::new(frames);
+        let mut lowest = f64::MAX;
+        for _ in 0..frames {
+            let power = out.out_gain().powi(2) + incoming.in_gain().powi(2);
+            lowest = lowest.min(power);
+            out.advance();
+            incoming.advance();
+        }
+        assert!(
+            (lowest - 1.0).abs() < 1e-9,
+            "power fell to {lowest} during the overlap"
+        );
+        // Both ramps finish together, so neither deck is left playing alone
+        // past the overlap the other was planned for.
+        assert!(out.finished() && incoming.finished());
+    }
+
+    /// The fade-in must cover the overlap and not end early, or the incoming
+    /// track stays quiet for part of it and then jumps to full level.
+    #[test]
+    fn the_fade_in_covers_every_frame_of_the_overlap() {
+        let frames = 64usize;
+        let mut ramp = Ramp::new(frames as u64);
+        let channels = crate::NUM_CHANNELS as usize;
+        let mut samples = vec![1.0f64; frames * channels];
+        apply_fade_in(&mut samples, &mut ramp);
+        assert!(ramp.finished(), "the ramp must consume the whole overlap");
+        // Silent at the first frame, full at the last, rising throughout.
+        assert!(samples[0].abs() < 1e-9);
+        assert!((samples[frames * channels - 1] - 1.0).abs() < 1e-9);
+        let gains: Vec<f64> = samples.chunks(channels).map(|f| f[0]).collect();
+        assert!(gains.windows(2).all(|pair| pair[1] >= pair[0]));
+    }
+
+    /// A ramp pair of different lengths would leave one deck playing after
+    /// the other stopped. The overlap is one number for both.
+    #[test]
+    fn both_decks_are_built_with_the_same_overlap_length() {
+        let frames = crossfade_frames(Duration::from_secs(6));
+        let out = Ramp::new(frames);
+        let incoming = Ramp::new(frames);
+        assert_eq!(out.total, incoming.total);
+    }
+
     #[test]
     fn ramp_runs_from_one_track_to_the_other() {
         let mut ramp = Ramp::new(100);
@@ -3282,12 +3338,24 @@ mod tests {
 
     #[test]
     fn ramp_holds_its_level_at_the_midpoint() {
-        let mut ramp = Ramp::new(100);
-        for _ in 0..50 {
+        // The curve spans the first frame to the last inclusive, so the
+        // halfway point falls between two frames. Either side of it must
+        // still sit within half a step of equal power.
+        let total = 100u64;
+        let mut ramp = Ramp::new(total);
+        for _ in 0..(total / 2) {
             ramp.advance();
         }
-        assert!((ramp.out_gain() - FRAC_1_SQRT_2).abs() < 1e-6);
-        assert!((ramp.out_gain().powi(2) + ramp.in_gain().powi(2) - 1.0).abs() < 1e-9);
+        let power = ramp.out_gain().powi(2) + ramp.in_gain().powi(2);
+        assert!(
+            (power - 1.0).abs() < 1e-9,
+            "the two decks must stay at equal power, got {power}"
+        );
+        // Equal power at the middle means each deck is 1/sqrt(2), within the
+        // one-frame rounding the inclusive curve introduces.
+        let step = std::f64::consts::FRAC_PI_2 / (total - 1) as f64;
+        assert!(ramp.out_gain() <= FRAC_1_SQRT_2);
+        assert!(ramp.out_gain() >= FRAC_1_SQRT_2 - step);
     }
 
     #[test]
