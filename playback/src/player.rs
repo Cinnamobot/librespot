@@ -426,6 +426,21 @@ impl Deck {
             &mut decoder, &mut source, &mut scratch, factor, &mut fed, budget,
         ) {}
 
+        // Settle the pipeline before the deck is handed over. Without this the
+        // outgoing track falls silent for the pipeline's length the instant
+        // the transition fires, because from then on the deck is what feeds
+        // it; measured at 0.0000 rms for the first ten milliseconds.
+        let mut deck = Self {
+            processor: handles.processor,
+            controller: handles.controller,
+            stop,
+            handle: None,
+            ready: VecDeque::new(),
+            out: vec![0.0; STRETCH_BLOCK_FRAMES * NUM_CHANNELS as usize],
+            underruns: 0,
+        };
+        deck.settle();
+
         let handle = thread::Builder::new()
             .name("crossfade-stretch".into())
             .spawn(move || {
@@ -470,15 +485,33 @@ impl Deck {
             })
             .expect("spawning the crossfade stretch thread");
 
-        Ok(Self {
-            processor: handles.processor,
-            controller: handles.controller,
-            stop,
-            handle: Some(handle),
-            ready: VecDeque::new(),
-            out: vec![0.0; STRETCH_BLOCK_FRAMES * NUM_CHANNELS as usize],
-            underruns: 0,
-        })
+        deck.handle = Some(handle);
+        Ok(deck)
+    }
+
+    /// Runs the pipeline up to steady state and throws the result away, so
+    /// the first frame the mix reads is real audio.
+    ///
+    /// The engine has a pipeline of its own — about 12.7 ms in the keylock
+    /// profile — and its stages start cold, taking a little longer than that
+    /// to settle. Without this, the moment a transition fires the outgoing
+    /// track goes silent while the pipeline fills: measured as 0.0000 rms for
+    /// the first ten milliseconds, which is heard as a click.
+    ///
+    /// What is discarded is the fill, not the track: the pipeline has not
+    /// emitted the opening yet, so this costs the tail a few tens of
+    /// milliseconds of its start rather than any of the music the listener
+    /// was already hearing.
+    fn settle(&mut self) {
+        // Long enough for the pipeline plus the slowest stage's settle, which
+        // the measurement puts at about 25 ms.
+        const SETTLE_FRAMES: usize = 2_048;
+        let mut discarded = 0;
+        let mut scratch = vec![0.0f32; self.out.len()];
+        while discarded < SETTLE_FRAMES {
+            self.processor.process(&mut scratch);
+            discarded += STRETCH_BLOCK_FRAMES;
+        }
     }
 
     /// The next `wanted` interleaved samples, already normalised.
@@ -3759,14 +3792,59 @@ mod tests {
     /// arrives sooner, but the pitch the listener hears must not move.
     fn dominant_frequency(samples: &[f64]) -> f64 {
         let mono: Vec<f64> = samples.chunks(NUM_CHANNELS as usize).map(|f| f[0]).collect();
-        // Ignore the ends: the engine's stages settle over the first blocks.
+        // The tail of the buffer is dropped: the deck pads its end with
+        // silence once the track is behind it, and zero crossings through
+        // silence say nothing about pitch. The head is kept, because the deck
+        // is settled before it is handed over and must start at full level —
+        // see `a_deck_starts_at_full_level`.
         let skip = (mono.len() / 4).max(1);
-        let body = &mono[skip..mono.len().saturating_sub(skip)];
+        let body = &mono[..mono.len().saturating_sub(skip)];
         let crossings = body
             .windows(2)
             .filter(|pair| (pair[0] < 0.0) != (pair[1] < 0.0))
             .count();
         crossings as f64 * f64::from(SAMPLE_RATE) / (2.0 * body.len() as f64)
+    }
+
+    /// The bug this covers: the moment a transition fires, the outgoing
+    /// track stops coming from the plain decode path and starts coming out of
+    /// the keylock engine. The engine's pipeline is about 12.7 ms long and its
+    /// stages start cold, so its first frames were silence — measured as
+    /// 0.0000 rms for the first ten milliseconds, which a listener hears as
+    /// the track being cut for an instant.
+    ///
+    /// The deck is settled before it is handed over, so the first frame the
+    /// mix reads is already at full level.
+    #[test]
+    fn a_deck_starts_at_full_level() {
+        let decoder: Box<dyn AudioDecoder + Send> = Box::new(StubDecoder {
+            packets: vec![tone(220.0, 44_100 * 2)],
+        });
+        let mut deck = match Deck::new(decoder, 1.06, 1.0, 44_100) {
+            Ok(deck) => deck,
+            Err(_) => panic!("the engine builds"),
+        };
+
+        // 5 ms buckets across the first 50 ms.
+        let block = 220;
+        let mut levels = Vec::new();
+        for _ in 0..10 {
+            let samples = deck.take(block * NUM_CHANNELS as usize);
+            let energy: f64 = samples.iter().map(|sample| sample * sample).sum();
+            levels.push((energy / samples.len() as f64).sqrt());
+        }
+        let steady = levels.iter().sum::<f64>() / levels.len() as f64;
+        assert!(steady > 0.1, "the deck produced no audio to measure");
+
+        // Every bucket must be near the steady level: a silent or half-level
+        // opening is the click this guards against.
+        for (index, level) in levels.iter().enumerate() {
+            assert!(
+                *level > steady * 0.5,
+                "the deck was at {level:.4} rms in bucket {index} (steady {steady:.4}); \
+                 the transition would be heard as a cut"
+            );
+        }
     }
 
     /// The deck must hand back the overlap's worth of audio, at the requested
