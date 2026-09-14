@@ -154,9 +154,13 @@ impl Ramp {
 }
 
 /// How much of the incoming track's opening to hand to a host that wants to
-/// plan a transition. Long enough for a tempo lock, short enough that the
-/// probe stays inside the preload's lead time.
-const INCOMING_PROBE_SECONDS: usize = 20;
+/// plan a transition.
+///
+/// Long enough to reach the track's first chorus, which is what a host needs
+/// to know to bring the next track in ahead of it rather than during it. The
+/// cost is a moment's decoding inside the preload, which happens off the
+/// audio path and well before the transition is due.
+const INCOMING_PROBE_SECONDS: usize = 90;
 
 /// Audio read from a preloaded track's opening, for a host planning the
 /// transition into it.
