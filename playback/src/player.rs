@@ -127,6 +127,25 @@ impl CrossfadePlan {
     }
 }
 
+/// Whether a rendered curve belongs to an overlap of `frames`.
+///
+/// The comparison cannot be exact: the planner builds the overlap's duration
+/// from an unrounded number of seconds while the player derives its frame
+/// count from truncated milliseconds, so the two land a few dozen frames
+/// apart on a long overlap — measured at 40 frames on a 6.6-second one. An
+/// exact check therefore discarded a curve that had been rendered perfectly
+/// well, and did it silently, so every transition took the one-deck fallback
+/// while the log said the pair was shared.
+///
+/// A millisecond of slack absorbs that rounding, and is far too small to
+/// accept a curve belonging to a different boundary: the shortest overlap the
+/// planner will make is a second and a half.
+fn curve_fits_overlap(curve: &IncomingCurve, frames: u64) -> bool {
+    let wanted = frames as usize * NUM_CHANNELS as usize;
+    let slack = (SAMPLE_RATE as usize / 1000) * NUM_CHANNELS as usize;
+    curve.samples.len().abs_diff(wanted) <= slack
+}
+
 struct Ramp {
     left: u64,
     total: u64,
@@ -2998,7 +3017,7 @@ impl PlayerInternal {
             .plan
             .as_ref()
             .and_then(|plan| plan.curve.clone())
-            .filter(|curve| curve.samples.len() == frames as usize * NUM_CHANNELS as usize);
+            .filter(|curve| curve_fits_overlap(curve, frames));
         let shared = curve.is_some();
         if let Some(curve) = curve {
             // The incoming decoder hands out the rendered overlap and then
@@ -4005,9 +4024,11 @@ mod tests {
     use super::{
         AudioPacket, AudioPacketPosition, BassShelf, BASS_SWAP_DEPTH_DB, BASS_SWAP_HZ,
         CROSSFADE_MAX, CrossfadePlan, Decoder, Deck, NUM_CHANNELS, Outgoing, PROBE_STEP_SAMPLES,
-        Ramp, SAMPLE_RATE, Tail, apply_fade_in, crossfade_frames, mix_tail, mix_tail_with_bass,
-        probe_step,
+        Ramp, SAMPLE_RATE, Tail, apply_fade_in, crossfade_frames, curve_fits_overlap, mix_tail,
+        mix_tail_with_bass, probe_step,
     };
+    use super::IncomingCurve;
+    use std::sync::Arc;
     use crate::decoder::{AudioDecoder, DecoderError, DecoderResult};
     use super::{LoadError, PlayerEvent, PlayerTrackLoader};
     use crate::core::{Error, SpotifyUri, audio_key::AudioKeyError};
@@ -4231,6 +4252,41 @@ mod tests {
             Box::new(StubDecoder { packets: vec![tone(220.0, 512)] });
         let outgoing = Outgoing::new(decoder, 1.0, 512, 1.0, None);
         assert!(matches!(outgoing.tail, Tail::Plain(_)));
+    }
+
+    /// The comparison that decides whether a rendered curve is used at all.
+    ///
+    /// Getting this wrong is silent: the transition still fires, it just
+    /// falls back to stretching one deck, and the only evidence is a listener
+    /// saying it sounds wrong. Measured on a real boundary, the rounding is
+    /// 40 frames on a 6.6-second overlap — so the tolerance is not slack for
+    /// tidiness, it is the difference between the feature working and not.
+    #[test]
+    fn a_curve_is_matched_to_its_overlap_within_the_rounding() {
+        let curve = |frames: usize| IncomingCurve {
+            samples: Arc::new(vec![0.0; frames * NUM_CHANNELS as usize]),
+            consumed_ms: 1_000,
+            ratio: 1.25,
+        };
+        let overlap = 6_624u64;
+        assert!(curve_fits_overlap(&curve(overlap as usize), overlap));
+        // The planner's unrounded duration against the player's truncated
+        // milliseconds: 40 frames on this overlap.
+        assert!(
+            curve_fits_overlap(&curve(overlap as usize + 40), overlap),
+            "the rounding must not discard a curve that fits"
+        );
+        assert!(curve_fits_overlap(&curve(overlap as usize - 40), overlap));
+        // A curve rendered for a different boundary is still refused: the
+        // shortest overlap the planner makes is a second and a half.
+        assert!(
+            !curve_fits_overlap(&curve(overlap as usize + 4_410), overlap),
+            "a curve for another boundary must not be used"
+        );
+        assert!(!curve_fits_overlap(
+            &curve(overlap as usize / 2),
+            overlap
+        ));
     }
 
     /// The whole point of the sweep, on the outgoing side: retargeting the
