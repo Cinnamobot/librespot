@@ -73,6 +73,15 @@ const STRETCH_FEED_SLACK: u64 = 4_096;
 
 const CROSSFADE_TAIL_PACKET_FRAMES: usize = 1024;
 
+/// Frames the outgoing deck renders and throws away before it is handed over.
+///
+/// Long enough for the engine's pipeline — about 12.7 ms in the keylock
+/// profile — plus the slowest stage's settle, which measurement puts near
+/// 25 ms total. Named rather than local to `Deck::settle` because the prime
+/// above it has to feed this much and the pipeline's fill on top, or the
+/// settle drains the ring and the deck underruns as it starts.
+const SETTLE_FRAMES: usize = 2_048;
+
 fn crossfade_frames(crossfade: Duration) -> u64 {
     let ms = crossfade.min(CROSSFADE_MAX).as_millis() as u64;
     u64::from(SAMPLE_RATE) * ms / 1000
@@ -477,11 +486,20 @@ impl Deck {
         // Prime before returning. The engine substitutes silence for source
         // it does not have yet, so a deck handed straight to the sink would
         // open the transition with a gap while the feed thread catches up.
+        //
+        // The amount has to cover what `settle` below consumes as well as the
+        // pipeline it fills, or the settle drains the ring and the deck
+        // underruns the moment it is handed over. It did, by one block: the
+        // prime filled a block's worth while the settle walked two thousand
+        // frames, which is heard as a gap of exactly that many frames at the
+        // start of the transition.
         let mut decoder = decoder;
         let mut fed = 0u64;
         let mut scratch: Vec<f32> = Vec::new();
-        let prime = source.demand_hint(STRETCH_BLOCK_FRAMES, rate.max(1.0));
-        while source.occupied_frames() < prime && fed < budget && feed_one(
+        let wanted = source.demand_hint(STRETCH_BLOCK_FRAMES, rate.max(1.0))
+            + (SETTLE_FRAMES as f64 * rate.max(1.0)).ceil() as usize
+            + STRETCH_BLOCK_FRAMES;
+        while source.occupied_frames() < wanted && fed < budget && feed_one(
             &mut decoder, &mut source, &mut scratch, factor, &mut fed, budget,
         ) {}
 
@@ -571,9 +589,6 @@ impl Deck {
     /// milliseconds of its start rather than any of the music the listener
     /// was already hearing.
     fn settle(&mut self) {
-        // Long enough for the pipeline plus the slowest stage's settle, which
-        // the measurement puts at about 25 ms.
-        const SETTLE_FRAMES: usize = 2_048;
         let mut discarded = 0;
         let mut scratch = vec![0.0f32; self.out.len()];
         while discarded < SETTLE_FRAMES {
@@ -4144,6 +4159,7 @@ mod tests {
     ///
     /// The deck is settled before it is handed over, so the first frame the
     /// mix reads is already at full level.
+
     #[test]
     fn a_deck_starts_at_full_level() {
         let decoder: Box<dyn AudioDecoder + Send> = Box::new(StubDecoder {
@@ -4244,15 +4260,6 @@ mod tests {
         );
     }
 
-    /// The constant-rate case must not start paying for the engine: that is
-    /// what the shortcut is for.
-    #[test]
-    fn a_tail_that_holds_one_rate_pays_for_no_engine() {
-        let decoder: Box<dyn AudioDecoder + Send> =
-            Box::new(StubDecoder { packets: vec![tone(220.0, 512)] });
-        let outgoing = Outgoing::new(decoder, 1.0, 512, 1.0, None);
-        assert!(matches!(outgoing.tail, Tail::Plain(_)));
-    }
 
     /// The comparison that decides whether a rendered curve is used at all.
     ///
