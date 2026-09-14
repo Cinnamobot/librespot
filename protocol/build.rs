@@ -80,6 +80,11 @@ fn compile() {
 }
 
 fn main() {
+    // Without these, Cargo re-runs this script on every build, and since it
+    // wipes OUT_DIR first that regenerates every protobuf module and forces
+    // librespot-core and everything downstream to rebuild too.
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=proto");
     cleanup();
     compile();
 }
