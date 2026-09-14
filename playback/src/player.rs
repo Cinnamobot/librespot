@@ -45,6 +45,11 @@ use crate::{NUM_CHANNELS, SAMPLE_RATE, SAMPLES_PER_SECOND};
 
 const PRELOAD_NEXT_TRACK_BEFORE_END_DURATION_MS: u32 = 30000;
 
+/// How much earlier than the overlap a crossfade asks for its next track.
+/// Loading takes a moment on a slow connection, and a preload that lands
+/// after the overlap has begun is of no use.
+const CROSSFADE_PRELOAD_SLACK: Duration = Duration::from_secs(20);
+
 const CROSSFADE_MAX: Duration = Duration::from_secs(12);
 
 const CROSSFADE_TAIL_PACKET_FRAMES: usize = 1024;
@@ -1836,6 +1841,14 @@ impl Future for PlayerInternal {
 
             self.maybe_begin_crossfade();
 
+            // Read before borrowing the state: the suggestion below needs
+            // both, and the state borrow is exclusive.
+            let crossfade_lead_ms = if self.crossfade().is_zero() {
+                0
+            } else {
+                (self.crossfade() + CROSSFADE_PRELOAD_SLACK).as_millis() as i64
+            };
+
             if let PlayerState::Playing {
                 ref track_id,
                 play_request_id,
@@ -1857,11 +1870,23 @@ impl Future for PlayerInternal {
             {
                 let track_id = track_id.clone();
 
-                if (!*suggested_to_preload_next_track)
-                    && ((duration_ms as i64 - stream_position_ms as i64)
-                        < PRELOAD_NEXT_TRACK_BEFORE_END_DURATION_MS as i64)
-                    && stream_loader_controller.range_to_end_available()
-                {
+                // Normally the suggestion waits until everything left in the
+                // track is buffered, because spirc's preload exists to have
+                // the next track ready the moment this one ends. A crossfade
+                // only needs the next track's opening, and it needs it
+                // earlier than the last thirty seconds, so waiting for the
+                // whole range would make the overlap miss its cue on a slow
+                // connection. Ask as soon as the crossfade's own lead time is
+                // in view instead.
+                let remaining_ms = duration_ms as i64 - stream_position_ms as i64;
+                let wants_preload = if crossfade_lead_ms == 0 {
+                    remaining_ms < PRELOAD_NEXT_TRACK_BEFORE_END_DURATION_MS as i64
+                        && stream_loader_controller.range_to_end_available()
+                } else {
+                    remaining_ms < crossfade_lead_ms
+                };
+
+                if !*suggested_to_preload_next_track && wants_preload {
                     *suggested_to_preload_next_track = true;
                     self.send_event(PlayerEvent::TimeToPreloadNextTrack {
                         track_id,
