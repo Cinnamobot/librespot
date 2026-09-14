@@ -302,7 +302,10 @@ fn mix_tail_with_bass(samples: &mut [f64], outgoing: &mut Outgoing) {
         }
     }
 
-    for (frame, filtered_frame) in samples.chunks_mut(channels).zip(filtered.chunks(channels)) {
+    for (frame, (tail_frame, filtered_frame)) in samples
+        .chunks_mut(channels)
+        .zip(tail.chunks(channels).zip(filtered.chunks(channels)))
+    {
         // How far the sweep has run, advanced one frame at a time.
         let mix = if *bass_left == 0 {
             1.0
@@ -311,9 +314,17 @@ fn mix_tail_with_bass(samples: &mut [f64], outgoing: &mut Outgoing) {
             1.0 - (*bass_left as f64 / (*bass_total).max(1) as f64)
         };
         let gain = ramp.out_gain();
-        for (sample, filtered_sample) in frame.iter_mut().zip(filtered_frame) {
-            // Blend dry towards the low-cut copy, then apply the fade itself.
-            let blended = *sample + (filtered_sample - *sample) * mix;
+        for ((sample, tail_sample), filtered_sample) in frame
+            .iter_mut()
+            .zip(tail_frame.iter())
+            .zip(filtered_frame.iter())
+        {
+            // The outgoing track is what is being mixed, so the blend is
+            // between its own dry and low-cut copies. Blending against the
+            // buffer's contents instead would fold the incoming track into
+            // the outgoing one, which is heard as the outgoing track losing
+            // its level the moment the overlap starts.
+            let blended = tail_sample + (filtered_sample - tail_sample) * mix;
             *sample += blended * gain;
         }
         ramp.advance();
@@ -3766,14 +3777,32 @@ mod tests {
 
     /// A tone at `hz`, as one packet of `frames` stereo frames.
     fn tone(hz: f64, frames: usize) -> Vec<f64> {
+        tone_from(hz, frames, 0)
+    }
+
+    /// The same tone, starting at `offset` frames into its cycle.
+    ///
+    /// A decoder hands out several packets and the deck plays them back to
+    /// back, so each packet has to continue the previous one's phase. A tone
+    /// that restarts at zero every packet has a discontinuity at every
+    /// boundary, which destroys any measurement that correlates against it.
+    fn tone_from(hz: f64, frames: usize, offset: usize) -> Vec<f64> {
         let mut out = Vec::with_capacity(frames * NUM_CHANNELS as usize);
         for frame in 0..frames {
-            let value = (2.0 * std::f64::consts::PI * hz * frame as f64 / f64::from(SAMPLE_RATE)).sin();
+            let t = (offset + frame) as f64;
+            let value = (2.0 * std::f64::consts::PI * hz * t / f64::from(SAMPLE_RATE)).sin();
             for _ in 0..NUM_CHANNELS {
                 out.push(value);
             }
         }
         out
+    }
+
+    /// A run of packets whose phases continue across the boundaries.
+    fn continuous_tone(hz: f64, packets: usize, frames_each: usize) -> Vec<Vec<f64>> {
+        (0..packets)
+            .map(|packet| tone_from(hz, frames_each, packet * frames_each))
+            .collect()
     }
 
     /// Counting zero crossings gives the tone's frequency, which is the whole
@@ -3966,6 +3995,81 @@ mod tests {
             assert!(steps < 10, "a spent track must end the probe");
         }
         assert!(!samples.is_empty(), "the opening was still read");
+    }
+
+    /// The amplitude of `hz` in `samples`, by correlation.
+    ///
+    /// Two tones at different frequencies are orthogonal over a long enough
+    /// window, so this reads one deck's contribution out of the mix without
+    /// the other interfering — which a plain level cannot do.
+    fn component_at(samples: &[f64], hz: f64) -> f64 {
+        let channels = NUM_CHANNELS as usize;
+        let frames = samples.len() / channels;
+        if frames == 0 {
+            return 0.0;
+        }
+        let sum: f64 = samples
+            .chunks(channels)
+            .enumerate()
+            .map(|(index, frame)| {
+                let phase = std::f64::consts::TAU * hz * index as f64 / f64::from(SAMPLE_RATE);
+                frame[0] * phase.sin()
+            })
+            .sum();
+        2.0 * sum / frames as f64
+    }
+
+    /// The bug this covers: the bass blend used the output buffer's contents
+    /// as its "dry" signal. During a crossfade that buffer already holds the
+    /// incoming track, so the blend folded the two together and the outgoing
+    /// track's own level collapsed — heard as the previous track suddenly
+    /// sounding small, separately from the fade.
+    ///
+    /// It only bites while the sweep is still running: once the blend reaches
+    /// 1.0 both the broken and the correct arithmetic reduce to the low-cut
+    /// tail, which is why this measures the start of the overlap.
+    ///
+    /// The two decks are given different amplitudes as well as different
+    /// frequencies. With equal amplitudes the broken arithmetic is
+    /// indistinguishable from the correct one, which is how an earlier
+    /// version of this test passed with the bug still in place.
+    #[test]
+    fn the_outgoing_track_keeps_its_level_under_an_incoming_one() {
+        const OUTGOING_HZ: f64 = 5_000.0;
+        const INCOMING_HZ: f64 = 8_000.0;
+        // The incoming track arrives quieter than the outgoing one, as it
+        // does at the start of an overlap. Equal levels would hide the fault.
+        const INCOMING_GAIN: f64 = 0.3;
+
+        let crossfade_frames = u64::from(SAMPLE_RATE) * 5;
+        let mut outgoing = Outgoing::new(
+            Box::new(StubDecoder {
+                packets: continuous_tone(OUTGOING_HZ, 400, 4_096),
+            }),
+            1.0,
+            crossfade_frames,
+            1.0,
+        );
+
+        let buffer_frames = 22_050usize;
+        let mut mixed: Vec<f64> = tone(INCOMING_HZ, buffer_frames)
+            .iter()
+            .map(|sample| sample * INCOMING_GAIN)
+            .collect();
+        mix_tail_with_bass(&mut mixed, &mut outgoing);
+
+        let heard = component_at(&mixed, OUTGOING_HZ);
+        // The shelf is transparent this far above its corner and the fade has
+        // barely started, so the outgoing track must arrive at its own level.
+        assert!(
+            heard > 0.75,
+            "the outgoing track arrived at {heard:.4} rms against an incoming one at \
+             {INCOMING_GAIN}; it started at full level and the fade has barely begun"
+        );
+        assert!(
+            heard < 1.3,
+            "the outgoing track arrived at {heard:.4}, louder than it is"
+        );
     }
 
     /// The two decks must sum to constant power across the whole overlap,
