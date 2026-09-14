@@ -2234,10 +2234,22 @@ impl Future for PlayerInternal {
 
             // Read before borrowing the state: the suggestion below needs
             // both, and the state borrow is exclusive.
-            let crossfade_lead_ms = if self.crossfade().is_zero() {
-                0
-            } else {
-                (self.crossfade() + CROSSFADE_PRELOAD_SLACK).as_millis() as i64
+            //
+            // A plan decides when the transition fires, and it may start
+            // much earlier than the configured crossfade: a host that mixes
+            // over the last chorus has a lead-in of half a minute or more.
+            // The preload has to follow the plan, not the setting, or the
+            // incoming track's analysis would land after the transition had
+            // already been planned without it.
+            let planned_lead = self
+                .plan
+                .map(|plan| plan.fade_out_before_end.max(plan.duration));
+            let crossfade_lead_ms = match (planned_lead, self.crossfade().is_zero()) {
+                (Some(lead), _) => (lead + CROSSFADE_PRELOAD_SLACK).as_millis() as i64,
+                (None, true) => 0,
+                (None, false) => {
+                    (self.crossfade() + CROSSFADE_PRELOAD_SLACK).as_millis() as i64
+                }
             };
 
             if let PlayerState::Playing {
