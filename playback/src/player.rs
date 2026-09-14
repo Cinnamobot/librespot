@@ -26,7 +26,9 @@ use crate::{
     config::{Bitrate, NormalisationMethod, NormalisationType, PlayerConfig},
     convert::Converter,
     core::{Error, Session, SpotifyId, SpotifyUri, audio_key::AudioKeyError, util::SeqGenerator},
-    decoder::{AudioDecoder, AudioPacket, AudioPacketPosition, SymphoniaDecoder},
+    decoder::{
+        AudioDecoder, AudioPacket, AudioPacketPosition, DecoderError, DecoderResult, SymphoniaDecoder,
+    },
     local_file::{LocalFileLookup, create_local_file_lookup},
     metadata::audio::{AudioFileFormat, AudioFiles, AudioItem},
     mixer::VolumeGetter,
@@ -82,7 +84,7 @@ fn crossfade_frames(crossfade: Duration) -> u64 {
 /// track's own offset is carried for the caller: a host that plans a
 /// beat-matched transition sets this just before loading, and seeks the
 /// loaded track to `fade_in_at` itself.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CrossfadePlan {
     /// Overlap length in seconds.
     pub duration: Duration,
@@ -94,7 +96,19 @@ pub struct CrossfadePlan {
     /// beats land where the incoming track's already are. It is the
     /// incoming track's tempo over the outgoing one's: a slower outgoing
     /// track is sped up. 1.0 leaves the outgoing track alone.
+    ///
+    /// With [`Self::curve`] set this is where the sweep *ends*: the tail
+    /// starts at its own tempo and is pulled onto this one as it hands over.
     pub tempo_rate: f64,
+    /// The incoming track's overlap, already rendered under the other half
+    /// of the sweep.
+    ///
+    /// The two decks share the stretch, and the incoming deck's half is
+    /// rendered ahead of the boundary rather than run live: it would have to
+    /// be fed from the same loop that reports the track's position, and a
+    /// deck fed whole packets while it consumes them at a swept rate either
+    /// underruns or runs the decoder ahead of what has been heard.
+    pub curve: Option<Arc<IncomingCurve>>,
 }
 
 impl CrossfadePlan {
@@ -108,6 +122,7 @@ impl CrossfadePlan {
             } else {
                 1.0
             },
+            curve: self.curve,
         }
     }
 }
@@ -398,9 +413,23 @@ struct Deck {
 
 impl Deck {
     /// Starts a keylocked deck to play `frames` of the tail at `rate`.
+    ///
     /// Hands the decoder back if the engine will not build, so the caller
     /// can still play the tail as it is.
-    fn new(decoder: Decoder, rate: f64, factor: f64, frames: u64) -> Result<Self, Decoder> {
+    ///
+    /// A swept tail does not consume the track evenly: it starts on the
+    /// outgoing track's own tempo and is pulled onto the incoming one, so
+    /// across the overlap it eats somewhere between the two. `budget_rate` is
+    /// the fastest it will be retargeted to, and budgeting on that end means
+    /// the feed always has enough source; the tail simply stops decoding once
+    /// the overlap is over, so nothing past it is pulled in.
+    fn new(
+        decoder: Decoder,
+        rate: f64,
+        factor: f64,
+        frames: u64,
+        budget_rate: f64,
+    ) -> Result<Self, Decoder> {
         let handles = match Engine::build(EngineConfig {
             sample_rate: SAMPLE_RATE,
             channels: NUM_CHANNELS as usize,
@@ -424,7 +453,7 @@ impl Deck {
         // how much of the track the overlap can reach. The rest of the track
         // is left undecoded: a transition out of the outro must not pull in
         // minutes of audio it will never play.
-        let budget = (frames as f64 * rate).ceil() as u64 + STRETCH_FEED_SLACK;
+        let budget = (frames as f64 * budget_rate).ceil() as u64 + STRETCH_FEED_SLACK;
 
         // Prime before returning. The engine substitutes silence for source
         // it does not have yet, so a deck handed straight to the sink would
@@ -498,6 +527,15 @@ impl Deck {
 
         deck.handle = Some(handle);
         Ok(deck)
+    }
+
+    /// Retargets the rate the deck plays at, from the next block on.
+    ///
+    /// A shared transition does not hold one ratio: the two decks move onto
+    /// a common tempo across the overlap, so this deck's rate is a curve
+    /// rather than the constant it was built with.
+    fn set_rate(&self, rate: f64) {
+        self.controller.set_tempo_rate(rate);
     }
 
     /// Runs the pipeline up to steady state and throws the result away, so
@@ -577,6 +615,13 @@ enum Tail {
 }
 
 impl Tail {
+    /// Retargets the deck, if this tail has one. A plain tail plays at its
+    /// own tempo because the pair was too close to be worth stretching.
+    fn set_rate(&self, rate: f64) {
+        if let Self::Stretched(deck) = self {
+            deck.set_rate(rate);
+        }
+    }
     /// The next `wanted` interleaved samples, already normalised. `None`
     /// once the track is behind this deck.
     fn produce(&mut self, wanted: usize, factor: f64) -> Option<Vec<f64>> {
@@ -620,19 +665,45 @@ struct Outgoing {
 }
 
 impl Outgoing {
-    fn new(decoder: Decoder, normalisation_factor: f64, frames: u64, rate: f64) -> Self {
+    /// `start_rate` is where the tail begins. `end_rate` is where a *shared*
+    /// transition sweeps it to: it is `None` when the tail carries the whole
+    /// stretch on its own, which is the case that has always existed.
+    ///
+    /// A shared tail starts at its own tempo and is pulled onto the incoming
+    /// track's, so its starting rate is 1.0 — but it must still be keylocked,
+    /// because the sweep takes it away from that tempo as it hands over. The
+    /// "not worth an engine" shortcut below therefore applies only to a tail
+    /// that holds one rate throughout.
+    fn new(
+        decoder: Decoder,
+        normalisation_factor: f64,
+        frames: u64,
+        start_rate: f64,
+        end_rate: Option<f64>,
+    ) -> Self {
         // The sweep runs over the first part of the overlap: the low end
         // leaves before the fade is half done, so the two basses never sit
         // together at equal level for long.
         let sweep = frames / 3;
+        // The deck is decoded far enough for the fastest rate it will reach,
+        // so a sweep that speeds up does not run out of source part way in.
+        let budget_rate = end_rate.map_or(start_rate, |end| start_rate.max(end));
+        let steady = end_rate.is_none() && (start_rate - 1.0).abs() < STRETCH_MIN_RATIO_DIFF;
         // A rate this close to 1.0 is inaudible as a tempo difference, so
-        // the engine is not worth starting for it.
-        let tail = if (rate - 1.0).abs() < STRETCH_MIN_RATIO_DIFF {
+        // the engine is not worth starting for it — unless the tail is
+        // sweeping, where 1.0 is only where it starts.
+        let tail = if steady {
             Tail::Plain(decoder)
         } else {
             // A tail that cannot be keylocked is still a tail: play it as it
             // is rather than losing the transition.
-            match Deck::new(decoder, rate, normalisation_factor, frames) {
+            match Deck::new(
+                decoder,
+                start_rate,
+                normalisation_factor,
+                frames,
+                budget_rate,
+            ) {
                 Ok(deck) => Tail::Stretched(Box::new(deck)),
                 Err(decoder) => Tail::Plain(decoder),
             }
@@ -729,6 +800,10 @@ struct PlayerInternal {
     crossfade: Duration,
     plan: Option<CrossfadePlan>,
     outgoing: Option<Outgoing>,
+    /// The ratio the outgoing tail is being swept towards, when this
+    /// transition shares its stretch between the decks. `None` means the tail
+    /// holds the constant rate it was built with.
+    outgoing_sweep: Option<f64>,
     fade_in: Option<Ramp>,
     adopting: Option<SpotifyUri>,
 }
@@ -1168,6 +1243,7 @@ impl Player {
                 crossfade: crossfade.min(CROSSFADE_MAX),
                 plan: None,
                 outgoing: None,
+                outgoing_sweep: None,
                 fade_in: None,
                 adopting: None,
             };
@@ -1389,6 +1465,156 @@ enum PlayerPreload {
 const PROBE_STEP_SAMPLES: usize = 16_384 * NUM_CHANNELS as usize;
 
 type Decoder = Box<dyn AudioDecoder + Send>;
+
+/// The incoming track's overlap, rendered ahead of the boundary under the
+/// tempo sweep.
+///
+/// Both decks move onto a shared tempo across an overlap, and the incoming
+/// deck's half of that sweep cannot be run live: it would have to be fed from
+/// the same decode loop that reports the track's position, and a deck fed
+/// whole packets while it consumes them at a swept rate either underruns or
+/// runs the decoder ahead of what has been heard. Rendering the overlap
+/// before the boundary removes the deadline — the source is pushed until
+/// there is room and the render pulled until the overlap is full — so the two
+/// cannot outrun each other.
+#[derive(PartialEq)]
+pub struct IncomingCurve {
+    /// Interleaved stereo at [`SAMPLE_RATE`], exactly the overlap's length.
+    pub samples: Arc<Vec<f32>>,
+    /// How much of the incoming track the render consumed, in milliseconds.
+    ///
+    /// The decoder is asked for whole packets while the curve plays at its
+    /// own rate, so by the end of the overlap it has travelled further than
+    /// the listener has heard. This is the distance to bring it back by, and
+    /// it is a property of the render rather than something to re-derive.
+    pub consumed_ms: u32,
+    /// The pair's tempo ratio, which the overlap's position is computed from.
+    pub ratio: f64,
+}
+
+impl std::fmt::Debug for IncomingCurve {
+    /// The samples are thousands of floats: printing them would drown the
+    /// enclosing plan's own fields.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IncomingCurve")
+            .field("frames", &(self.samples.len() / NUM_CHANNELS as usize))
+            .field("consumed_ms", &self.consumed_ms)
+            .field("ratio", &self.ratio)
+            .finish()
+    }
+}
+
+/// How much of the curve is handed out per packet.
+const CURVE_PACKET_FRAMES: usize = 4_096;
+
+/// Plays a pre-rendered overlap and then carries on with the track itself.
+///
+/// The player's loop needs no knowledge of the sweep: it asks this decoder
+/// for packets exactly as it asked the real one, and gets the overlap's audio
+/// at its own rate. Once the curve is spent the inner decoder is put where
+/// the listener actually got to, and every later packet is the track's own.
+struct CurvedDecoder {
+    curve: Arc<Vec<f32>>,
+    cursor: usize,
+    inner: Decoder,
+    /// Where in the track the overlap began.
+    start_ms: u32,
+    /// How far the track really advanced across the overlap.
+    consumed_ms: u32,
+    /// The pair's tempo ratio, which the position integral is computed from.
+    ratio: f64,
+    /// Whether the inner decoder has been put back on the beat yet.
+    handed_over: bool,
+}
+
+impl CurvedDecoder {
+    fn new(curve: IncomingCurve, inner: Decoder, start_ms: u32) -> Self {
+        Self {
+            curve: curve.samples,
+            cursor: 0,
+            inner,
+            start_ms,
+            consumed_ms: curve.consumed_ms,
+            ratio: curve.ratio,
+            handed_over: false,
+        }
+    }
+
+    /// How much of the track the curve has consumed by output position
+    /// `progress`, as a fraction of the whole overlap.
+    ///
+    /// The incoming deck plays at `r^(p-1)` of the track's own tempo, so the
+    /// track covered by output position `p` is that rate's integral, over the
+    /// whole sweep's integral. Reporting the true figure rather than the wall
+    /// clock keeps the position continuous: it starts at the overlap's own
+    /// start and finishes exactly at the point the decoder is resumed from,
+    /// so the hand-over has no step in it.
+    fn consumed_fraction(&self, progress: f64) -> f64 {
+        let ratio = self.ratio;
+        if (ratio - 1.0).abs() < 1e-9 {
+            return progress;
+        }
+        let ln = ratio.ln();
+        let total = (1.0 - 1.0 / ratio) / ln;
+        if total <= 0.0 {
+            return progress;
+        }
+        ((ratio.powf(progress - 1.0) - 1.0 / ratio) / ln / total).clamp(0.0, 1.0)
+    }
+
+    /// Where in the track the audio just handed out comes from.
+    fn position_ms(&self) -> u32 {
+        let channels = NUM_CHANNELS as usize;
+        let total_frames = self.curve.len() / channels;
+        if total_frames == 0 {
+            return self.start_ms;
+        }
+        let progress = (self.cursor / channels) as f64 / total_frames as f64;
+        let consumed = self.consumed_ms as f64 * self.consumed_fraction(progress);
+        self.start_ms.saturating_add(consumed as u32)
+    }
+}
+
+impl AudioDecoder for CurvedDecoder {
+    fn seek(&mut self, position_ms: u32) -> Result<u32, DecoderError> {
+        // A seek abandons the boundary this curve was rendered for: the
+        // listener has moved somewhere else entirely.
+        self.cursor = self.curve.len();
+        self.handed_over = true;
+        self.inner.seek(position_ms)
+    }
+
+    fn next_packet(&mut self) -> DecoderResult<Option<(AudioPacketPosition, AudioPacket)>> {
+        if self.cursor < self.curve.len() {
+            let channels = NUM_CHANNELS as usize;
+            let end = (self.cursor + CURVE_PACKET_FRAMES * channels).min(self.curve.len());
+            let position_ms = self.position_ms();
+            let samples: Vec<f64> = self.curve[self.cursor..end]
+                .iter()
+                .map(|sample| f64::from(*sample))
+                .collect();
+            self.cursor = end;
+            return Ok(Some((
+                AudioPacketPosition {
+                    position_ms,
+                    skipped: false,
+                },
+                AudioPacket::Samples(samples),
+            )));
+        }
+        if !self.handed_over {
+            self.handed_over = true;
+            // Past the curve, the track's own audio resumes — from where the
+            // listener was actually taken to, which is the overlap's start
+            // plus what the sweep consumed.
+            let target = self.start_ms.saturating_add(self.consumed_ms);
+            if let Err(error) = self.inner.seek(target) {
+                warn!("Unable to put the incoming track back on the beat: {error}");
+            }
+        }
+        self.inner.next_packet()
+    }
+}
 
 enum PlayerState {
     Stopped,
@@ -2347,6 +2573,7 @@ impl Future for PlayerInternal {
             // already been planned without it.
             let planned_lead = self
                 .plan
+                .as_ref()
                 .map(|plan| plan.fade_out_before_end.max(plan.duration));
             let crossfade_lead_ms = match (planned_lead, self.crossfade().is_zero()) {
                 (Some(lead), _) => (lead + CROSSFADE_PRELOAD_SLACK).as_millis() as i64,
@@ -2575,6 +2802,7 @@ impl PlayerInternal {
 
     fn drop_crossfade(&mut self) {
         self.outgoing = None;
+        self.outgoing_sweep = None;
         self.fade_in = None;
         self.adopting = None;
         self.plan = None;
@@ -2606,6 +2834,18 @@ impl PlayerInternal {
 
     fn mix_outgoing(&mut self, data: &mut [f64]) {
         if let Some(outgoing) = &mut self.outgoing {
+            // A shared transition sweeps the tail onto the incoming track's
+            // tempo as it hands over, so both decks are at their own tempo
+            // when they are loudest. The fade ramp is the clock: it spans
+            // exactly the overlap and it is what the incoming half was
+            // rendered against, so reading progress off it keeps the two
+            // halves on the same schedule. Retargeting per packet is enough
+            // because the engine only takes a rate per block, and it clamps
+            // how far ahead a retarget may be scheduled.
+            if let Some(ratio) = self.outgoing_sweep {
+                let progress = outgoing.ramp.progress();
+                outgoing.tail.set_rate(ratio.powf(progress));
+            }
             mix_tail_with_bass(data, outgoing);
         }
         self.outgoing.take_if(|outgoing| outgoing.finished());
@@ -2700,7 +2940,7 @@ impl PlayerInternal {
         };
         // A planned transition may be shorter than the configured crossfade,
         // and may start later, so its own overlap governs when it fires.
-        let (start_within, duration) = match self.plan {
+        let (start_within, duration) = match &self.plan {
             Some(plan) => (plan.fade_out_before_end.max(plan.duration), plan.duration),
             None => (crossfade, crossfade),
         };
@@ -2713,7 +2953,7 @@ impl PlayerInternal {
             );
             return;
         }
-        let rate = self.plan.map_or(1.0, |plan| plan.tempo_rate);
+        let rate = self.plan.as_ref().map_or(1.0, |plan| plan.tempo_rate);
         debug!(
             "crossfade: firing with {:.2}s overlap, outgoing tail at {rate:.4}x",
             duration.as_secs_f64()
@@ -2749,7 +2989,42 @@ impl PlayerInternal {
             }
         }
         let frames = crossfade_frames(crossfade);
-        let (track_id, play_request_id) = match self.take_outgoing(frames, rate) {
+        // A shared transition: the incoming track's half of the sweep is
+        // already rendered, and the outgoing tail sweeps its own half. Taken
+        // before the plan is cleared, and only when the curve matches this
+        // overlap — a plan whose curve was rendered for a different length
+        // would hand the mix audio that does not line up.
+        let curve = self
+            .plan
+            .as_ref()
+            .and_then(|plan| plan.curve.clone())
+            .filter(|curve| curve.samples.len() == frames as usize * NUM_CHANNELS as usize);
+        let shared = curve.is_some();
+        if let Some(curve) = curve {
+            // The incoming decoder hands out the rendered overlap and then
+            // resumes the track itself, put back where the listener actually
+            // got to. The mix and the player's own loop need no knowledge of
+            // the sweep: they ask for packets exactly as they always did.
+            let start_ms = loaded_track.stream_position_ms;
+            loaded_track.decoder = Box::new(CurvedDecoder::new(
+                IncomingCurve {
+                    samples: Arc::clone(&curve.samples),
+                    consumed_ms: curve.consumed_ms,
+                    ratio: curve.ratio,
+                },
+                loaded_track.decoder,
+                start_ms,
+            ));
+        }
+        // A shared transition starts the tail on the outgoing track's own
+        // tempo and sweeps it onto the incoming one, which is the other half
+        // of the same curve, so the pair keeps a constant quotient. Without a
+        // curve the tail carries the whole stretch and holds it.
+        let (start_rate, end_rate) = match shared {
+            true => (1.0, Some(rate)),
+            false => (rate, None),
+        };
+        let (track_id, play_request_id) = match self.take_outgoing(frames, start_rate, end_rate) {
             Some(taken) => taken,
             None => {
                 self.preload = PlayerPreload::Ready {
@@ -2759,6 +3034,7 @@ impl PlayerInternal {
                 return;
             }
         };
+        self.outgoing_sweep = end_rate;
         self.fade_in = Some(Ramp::new(frames));
         self.adopting = Some(next_track_id.clone());
         // The plan describes one boundary: the transition it was made for.
@@ -2772,7 +3048,18 @@ impl PlayerInternal {
         self.start_playback(next_track_id, play_request_id, *loaded_track, true);
     }
 
-    fn take_outgoing(&mut self, frames: u64, rate: f64) -> Option<(SpotifyUri, u64)> {
+    /// Takes the outgoing track apart into a deck playing `frames` of its
+    /// tail.
+    ///
+    /// `start_rate` is where the tail begins, and `end_rate` is where a
+    /// shared transition sweeps it to — `None` when the tail carries the
+    /// whole stretch by itself, which is the constant-rate case.
+    fn take_outgoing(
+        &mut self,
+        frames: u64,
+        start_rate: f64,
+        end_rate: Option<f64>,
+    ) -> Option<(SpotifyUri, u64)> {
         match mem::replace(&mut self.state, PlayerState::Invalid) {
             PlayerState::Playing {
                 track_id,
@@ -2786,7 +3073,7 @@ impl PlayerInternal {
                 } else {
                     1.0
                 };
-                self.outgoing = Some(Outgoing::new(decoder, factor, frames, rate));
+                self.outgoing = Some(Outgoing::new(decoder, factor, frames, start_rate, end_rate));
                 Some((track_id, play_request_id))
             }
             other => {
@@ -2806,10 +3093,13 @@ impl PlayerInternal {
             return;
         }
         let frames = crossfade_frames(crossfade);
-        if self.take_outgoing(frames, 1.0).is_some() {
+        if self.take_outgoing(frames, 1.0, None).is_some() {
             self.state = PlayerState::Stopped;
             self.fade_in = Some(Ramp::new(frames));
         }
+        // A skip is not a planned boundary: the two tracks are unrelated, so
+        // they are not stretched onto a shared tempo.
+        self.outgoing_sweep = None;
         // A skip cuts the planned boundary short; it must not fire later.
         self.plan = None;
     }
@@ -3838,7 +4128,7 @@ mod tests {
         let decoder: Box<dyn AudioDecoder + Send> = Box::new(StubDecoder {
             packets: vec![tone(220.0, 44_100 * 2)],
         });
-        let mut deck = match Deck::new(decoder, 1.06, 1.0, 44_100) {
+        let mut deck = match Deck::new(decoder, 1.06, 1.0, 44_100, 1.06) {
             Ok(deck) => deck,
             Err(_) => panic!("the engine builds"),
         };
@@ -3879,7 +4169,7 @@ mod tests {
         let decoder: Box<dyn AudioDecoder + Send> = Box::new(StubDecoder {
             packets: vec![tone(hz, frames)],
         });
-        let mut deck = match Deck::new(decoder, rate, 1.0, overlap) {
+        let mut deck = match Deck::new(decoder, rate, 1.0, overlap, rate) {
             Ok(deck) => deck,
             Err(_) => panic!("the engine builds"),
         };
@@ -3915,13 +4205,54 @@ mod tests {
         // says 1.02 is 2% faster.
     }
 
-    /// A rate within a hair of 1.0 must not pay for the engine at all.
+    /// A shared transition starts the tail at its own tempo, so a check on
+    /// the *starting* rate alone would decide the engine is not worth
+    /// building — and then the sweep would have nowhere to happen, because a
+    /// plain tail ignores every retarget. That was a real bug: the incoming
+    /// deck would have swept while the outgoing one stood still, and the two
+    /// would have drifted apart.
     #[test]
-    fn a_tail_at_its_own_tempo_stays_unstretched() {
+    fn a_swept_tail_is_keylocked_even_though_it_starts_at_its_own_tempo() {
+        let decoder: Box<dyn AudioDecoder + Send> =
+            Box::new(StubDecoder { packets: vec![tone(220.0, 44_100)] });
+        // Starts at 1.0, ends at 1.25: the shared-transition shape.
+        let outgoing = Outgoing::new(decoder, 1.0, 4_096, 1.0, Some(1.25));
+        assert!(
+            matches!(outgoing.tail, Tail::Stretched(_)),
+            "a tail that is swept must have a deck to sweep"
+        );
+    }
+
+    /// The constant-rate case must not start paying for the engine: that is
+    /// what the shortcut is for.
+    #[test]
+    fn a_tail_that_holds_one_rate_pays_for_no_engine() {
         let decoder: Box<dyn AudioDecoder + Send> =
             Box::new(StubDecoder { packets: vec![tone(220.0, 512)] });
-        let mut outgoing = Outgoing::new(decoder, 1.0, 512, 1.0001);
+        let outgoing = Outgoing::new(decoder, 1.0, 512, 1.0, None);
         assert!(matches!(outgoing.tail, Tail::Plain(_)));
+    }
+
+    /// The whole point of the sweep, on the outgoing side: retargeting the
+    /// deck must actually change the tempo it plays at, or the pair would
+    /// stop being locked the moment the incoming deck moved.
+    #[test]
+    fn a_stretched_tail_follows_its_retargets() {
+        let decoder: Box<dyn AudioDecoder + Send> = Box::new(StubDecoder {
+            packets: continuous_tone(220.0, 64, 4_096),
+        });
+        let outgoing = Outgoing::new(decoder, 1.0, 8_192, 1.0, Some(1.25));
+        let Tail::Stretched(deck) = &outgoing.tail else {
+            panic!("a swept tail is stretched");
+        };
+        // Retargeting is a no-op on a plain tail, so this both exercises the
+        // path and asserts it exists.
+        deck.set_rate(1.25);
+        assert!(
+            (deck.controller.tempo_rate_target() - 1.25).abs() < 1e-9,
+            "the deck ignored the retarget: target is {}",
+            deck.controller.tempo_rate_target()
+        );
     }
 
     /// A decoder that hands out its audio in small packets, so a step can be
@@ -4049,6 +4380,7 @@ mod tests {
             1.0,
             crossfade_frames,
             1.0,
+            None,
         );
 
         let buffer_frames = 22_050usize;
@@ -4168,7 +4500,7 @@ mod tests {
         let decoder: Box<dyn AudioDecoder + Send> = Box::new(StubDecoder {
             packets: vec![vec![0.3; total]],
         });
-        let mut outgoing = Outgoing::new(decoder, 1.0, frames, 1.0);
+        let mut outgoing = Outgoing::new(decoder, 1.0, frames, 1.0, None);
         assert_eq!(
             outgoing.bass_left, outgoing.bass_total,
             "the sweep starts unengaged"
@@ -4275,7 +4607,7 @@ mod tests {
         let decoder = StubDecoder {
             packets: vec![vec![1.0; 6], vec![1.0; 2], vec![1.0; 10]],
         };
-        let mut outgoing = Outgoing::new(Box::new(decoder), 1.0, 100, 1.0);
+        let mut outgoing = Outgoing::new(Box::new(decoder), 1.0, 100, 1.0, None);
         assert_eq!(outgoing.take(4).len(), 8);
         assert_eq!(outgoing.take(4).len(), 8);
     }
@@ -4285,7 +4617,7 @@ mod tests {
         let decoder = StubDecoder {
             packets: vec![vec![1.0; 4]],
         };
-        let mut outgoing = Outgoing::new(Box::new(decoder), 1.0, 100, 1.0);
+        let mut outgoing = Outgoing::new(Box::new(decoder), 1.0, 100, 1.0, None);
         assert_eq!(
             outgoing.take(4),
             vec![1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
@@ -4298,7 +4630,7 @@ mod tests {
         let decoder = StubDecoder {
             packets: vec![vec![1.0; 4]],
         };
-        let mut outgoing = Outgoing::new(Box::new(decoder), 0.5, 100, 1.0);
+        let mut outgoing = Outgoing::new(Box::new(decoder), 0.5, 100, 1.0, None);
         assert_eq!(outgoing.take(2), vec![0.5, 0.5, 0.5, 0.5]);
     }
 
@@ -4322,6 +4654,7 @@ mod tests {
             fade_out_before_end: Duration::from_secs(9),
             fade_in_at: Duration::from_millis(500),
             tempo_rate: 1.0,
+            curve: None,
         }
         .clamped();
         assert_eq!(plan.duration, Duration::from_secs(3));
@@ -4339,6 +4672,7 @@ mod tests {
             fade_out_before_end: Duration::from_secs(60),
             fade_in_at: Duration::ZERO,
             tempo_rate: 1.0,
+            curve: None,
         }
         .clamped();
         assert_eq!(plan.duration, CROSSFADE_MAX);
@@ -4351,6 +4685,7 @@ mod tests {
             fade_out_before_end: Duration::ZERO,
             fade_in_at: Duration::ZERO,
             tempo_rate: 1.0,
+            curve: None,
         }
         .clamped();
         assert_eq!(plan.fade_out_before_end, Duration::ZERO);
