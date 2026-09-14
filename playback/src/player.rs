@@ -170,11 +170,121 @@ fn probe_incoming(loaded_track: &mut PlayerLoadedTrackData) -> Result<IncomingPr
     })
 }
 
+/// Frequency the bass swap splits at, in Hz.
+///
+/// Below this sits the kick and the bassline, which two tracks cannot share
+/// without turning to mud. The figure is the usual one for the trick: high
+/// enough to catch the low end, low enough to leave the vocal and most
+/// instruments untouched.
+const BASS_SWAP_HZ: f64 = 200.0;
+
+/// How far down the outgoing deck's low end goes. Deep enough that the
+/// incoming track's bass is the only one left, shallow enough that the
+/// shelf does not take the body out of the mix.
+const BASS_SWAP_DEPTH_DB: f64 = 24.0;
+
+/// A low shelf that can be swept to take a deck's low end out.
+///
+/// Two tracks overlapping share their bass, and bass is where the mud is.
+/// A DJ takes the low end off one deck and then the other, so only one
+/// track owns it at a time. This is that shelf: engaged on the outgoing
+/// deck as the fade begins, and released on the incoming one as the other
+/// lets go.
+#[derive(Clone, Copy, Debug, Default)]
+struct BassShelf {
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+    x1: f64,
+    x2: f64,
+    y1: f64,
+    y2: f64,
+}
+
+impl BassShelf {
+    /// A low shelf at `hz`, `gain_db` below unity.
+    ///
+    /// After the Audio EQ Cookbook's shelf, which is what the equalizer in
+    /// this crate uses too, so the two sound alike.
+    fn new(hz: f64, gain_db: f64) -> Self {
+        let a = 10f64.powf(gain_db / 40.0);
+        let w0 = std::f64::consts::TAU * hz / f64::from(SAMPLE_RATE);
+        let (sin, cos) = w0.sin_cos();
+        let alpha = sin / 2.0 * 2f64.sqrt();
+        let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
+        let a0 = (a + 1.0) + (a - 1.0) * cos + two_sqrt_a_alpha;
+        Self {
+            b0: a * ((a + 1.0) - (a - 1.0) * cos + two_sqrt_a_alpha) / a0,
+            b1: 2.0 * a * ((a - 1.0) - (a + 1.0) * cos) / a0,
+            b2: a * ((a + 1.0) - (a - 1.0) * cos - two_sqrt_a_alpha) / a0,
+            a1: -2.0 * ((a - 1.0) + (a + 1.0) * cos) / a0,
+            a2: ((a + 1.0) + (a - 1.0) * cos - two_sqrt_a_alpha) / a0,
+            ..Self::default()
+        }
+    }
+
+    #[inline]
+    fn run(&mut self, x: f64) -> f64 {
+        let y =
+            self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2 - self.a1 * self.y1 - self.a2 * self.y2;
+        self.x2 = self.x1;
+        self.x1 = x;
+        self.y2 = self.y1;
+        self.y1 = y;
+        y
+    }
+}
+
 fn apply_fade_in(samples: &mut [f64], ramp: &mut Ramp) {
     for frame in samples.chunks_mut(NUM_CHANNELS as usize) {
         let gain = ramp.in_gain();
         for sample in frame.iter_mut() {
             *sample *= gain;
+        }
+        ramp.advance();
+    }
+}
+
+/// Mixes the outgoing deck under the incoming one, sweeping its bass out
+/// as the two overlap.
+fn mix_tail_with_bass(samples: &mut [f64], outgoing: &mut Outgoing) {
+    let channels = NUM_CHANNELS as usize;
+    let frames = samples.len() / channels;
+    let tail = outgoing.take(frames);
+
+    // Filter the whole tail once, then blend each frame towards it by how
+    // far the sweep has run.
+    let Outgoing {
+        filtered,
+        bass,
+        ramp,
+        bass_left,
+        bass_total,
+        ..
+    } = outgoing;
+    filtered.clear();
+    filtered.extend_from_slice(&tail);
+    for frame in filtered.chunks_mut(channels) {
+        for (sample, shelf) in frame.iter_mut().zip(bass.iter_mut()) {
+            *sample = shelf.run(*sample);
+        }
+    }
+
+    for (frame, filtered_frame) in samples.chunks_mut(channels).zip(filtered.chunks(channels)) {
+        // How far the sweep has run, advanced one frame at a time.
+        let mix = if *bass_left == 0 {
+            1.0
+        } else {
+            *bass_left -= 1;
+            1.0 - (*bass_left as f64 / (*bass_total).max(1) as f64)
+        };
+        let gain = ramp.out_gain();
+        for (sample, filtered_sample) in frame.iter_mut().zip(filtered_frame) {
+            // Blend dry towards the low-cut copy, then apply the fade itself.
+            let blended = *sample + (filtered_sample - *sample) * mix;
+            *sample += blended * gain;
         }
         ramp.advance();
     }
@@ -196,16 +306,36 @@ struct Outgoing {
     normalisation_factor: f64,
     pending: VecDeque<f64>,
     ramp: Ramp,
+    /// Takes this deck's low end out, so the incoming track owns the bass
+    /// for the length of the overlap. Fixed at full depth; how much of it is
+    /// heard is the blend below.
+    bass: Vec<BassShelf>,
+    /// The filtered copy of the outgoing tail, reused every packet so the
+    /// mix does not allocate while the sink is waiting on it.
+    filtered: Vec<f64>,
+    /// How far the shelf is engaged, swept across the first part of the fade.
+    bass_left: u64,
+    bass_total: u64,
     ended: bool,
 }
 
 impl Outgoing {
     fn new(decoder: Decoder, normalisation_factor: f64, frames: u64) -> Self {
+        // The sweep runs over the first part of the overlap: the low end
+        // leaves before the fade is half done, so the two basses never sit
+        // together at equal level for long.
+        let sweep = frames / 3;
         Self {
             decoder,
             normalisation_factor,
             pending: VecDeque::new(),
             ramp: Ramp::new(frames),
+            bass: (0..NUM_CHANNELS)
+                .map(|_| BassShelf::new(BASS_SWAP_HZ, -BASS_SWAP_DEPTH_DB))
+                .collect(),
+            filtered: Vec::new(),
+            bass_left: sweep,
+            bass_total: sweep.max(1),
             ended: false,
         }
     }
@@ -2101,10 +2231,8 @@ impl PlayerInternal {
     }
 
     fn mix_outgoing(&mut self, data: &mut [f64]) {
-        let frames = data.len() / NUM_CHANNELS as usize;
         if let Some(outgoing) = &mut self.outgoing {
-            let tail = outgoing.take(frames);
-            mix_tail(data, &tail, &mut outgoing.ramp);
+            mix_tail_with_bass(data, outgoing);
         }
         self.outgoing.take_if(|outgoing| outgoing.finished());
     }
@@ -3210,8 +3338,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AudioPacket, AudioPacketPosition, CROSSFADE_MAX, CrossfadePlan, Outgoing, Ramp,
-        apply_fade_in, crossfade_frames, mix_tail,
+        AudioPacket, AudioPacketPosition, BassShelf, BASS_SWAP_DEPTH_DB, BASS_SWAP_HZ,
+        CROSSFADE_MAX, CrossfadePlan, Outgoing, Ramp, apply_fade_in, crossfade_frames,
+        mix_tail, mix_tail_with_bass,
     };
     use crate::decoder::{AudioDecoder, DecoderError, DecoderResult};
     use super::{LoadError, PlayerEvent, PlayerTrackLoader};
@@ -3321,6 +3450,84 @@ mod tests {
         let out = Ramp::new(frames);
         let incoming = Ramp::new(frames);
         assert_eq!(out.total, incoming.total);
+    }
+
+    /// The shelf must actually take the low end out, or the swap does
+    /// nothing and both tracks fight over the bass.
+    #[test]
+    fn the_bass_shelf_cuts_the_low_end() {
+        let rate = f64::from(crate::SAMPLE_RATE);
+        let low = 60.0;
+        let shelf = BassShelf::new(BASS_SWAP_HZ, -BASS_SWAP_DEPTH_DB);
+
+        // Measure a low tone and a high one through the same filter.
+        let amplitude = |hz: f64, mut filter: BassShelf| {
+            let mut peak: f64 = 0.0;
+            // Let the filter settle before measuring.
+            for index in 0..(rate as usize / 4) {
+                let t = index as f64 / rate;
+                let out = filter.run((std::f64::consts::TAU * hz * t).sin());
+                if index > rate as usize / 8 {
+                    peak = peak.max(out.abs());
+                }
+            }
+            peak
+        };
+        let low_out = amplitude(low, shelf);
+        let high_out = amplitude(4000.0, shelf);
+        assert!(
+            low_out < 0.5,
+            "60 Hz came through at {low_out}, the low cut is not working"
+        );
+        assert!(
+            high_out > 0.9,
+            "4 kHz was cut to {high_out}, the shelf reaches too high"
+        );
+    }
+
+    /// The sweep must start with the bass intact and end with it gone, so
+    /// the handover happens across the overlap rather than all at once.
+    #[test]
+    fn the_bass_sweep_runs_from_untouched_to_cut() {
+        let frames = 90u64;
+        let channels = crate::NUM_CHANNELS as usize;
+        let total = frames as usize * channels;
+        let decoder: Box<dyn AudioDecoder + Send> = Box::new(StubDecoder {
+            packets: vec![vec![0.3; total]],
+        });
+        let mut outgoing = Outgoing::new(decoder, 1.0, frames);
+        assert_eq!(
+            outgoing.bass_left, outgoing.bass_total,
+            "the sweep starts unengaged"
+        );
+
+        let mut data = vec![0.0f64; total];
+        mix_tail_with_bass(&mut data, &mut outgoing);
+        assert!(
+            outgoing.bass_left < outgoing.bass_total,
+            "the sweep must advance as the overlap plays"
+        );
+        assert_eq!(outgoing.bass_left, 0, "one packet spans the whole sweep");
+    }
+
+    /// A shelf at zero depth must be transparent: it is the state the
+    /// incoming deck's filter sits in when it owns the bass.
+    #[test]
+    fn the_bass_shelf_leaves_the_signal_alone_at_zero_depth() {
+        let mut filter = BassShelf::new(BASS_SWAP_HZ, 0.0);
+        let rate = f64::from(crate::SAMPLE_RATE);
+        let mut peak: f64 = 0.0;
+        for index in 0..(rate as usize / 4) {
+            let t = index as f64 / rate;
+            let out = filter.run((std::f64::consts::TAU * 60.0 * t).sin());
+            if index > rate as usize / 8 {
+                peak = peak.max(out.abs());
+            }
+        }
+        assert!(
+            (peak - 1.0).abs() < 0.02,
+            "a zero-depth shelf changed the level to {peak}"
+        );
     }
 
     #[test]
