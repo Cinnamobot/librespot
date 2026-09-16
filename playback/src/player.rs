@@ -27,7 +27,8 @@ use crate::{
     convert::Converter,
     core::{Error, Session, SpotifyId, SpotifyUri, audio_key::AudioKeyError, util::SeqGenerator},
     decoder::{
-        AudioDecoder, AudioPacket, AudioPacketPosition, DecoderError, DecoderResult, SymphoniaDecoder,
+        AudioDecoder, AudioPacket, AudioPacketPosition, DecoderError, DecoderResult,
+        SymphoniaDecoder,
     },
     local_file::{LocalFileLookup, create_local_file_lookup},
     metadata::audio::{AudioFileFormat, AudioFiles, AudioItem},
@@ -334,8 +335,9 @@ impl BassShelf {
 
     #[inline]
     fn run(&mut self, x: f64) -> f64 {
-        let y =
-            self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2 - self.a1 * self.y1 - self.a2 * self.y2;
+        let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
+            - self.a1 * self.y1
+            - self.a2 * self.y2;
         self.x2 = self.x1;
         self.x1 = x;
         self.y2 = self.y1;
@@ -533,9 +535,17 @@ impl Deck {
         let wanted = source.demand_hint(STRETCH_BLOCK_FRAMES, rate.max(1.0))
             + (SETTLE_FRAMES as f64 * rate.max(1.0)).ceil() as usize
             + STRETCH_BLOCK_FRAMES;
-        while source.occupied_frames() < wanted && fed < budget && feed_one(
-            &mut decoder, &mut source, &mut scratch, factor, &mut fed, budget,
-        ) {}
+        while source.occupied_frames() < wanted
+            && fed < budget
+            && feed_one(
+                &mut decoder,
+                &mut source,
+                &mut scratch,
+                factor,
+                &mut fed,
+                budget,
+            )
+        {}
 
         // Settle the pipeline before the deck is handed over. Without this the
         // outgoing track falls silent for the pipeline's length the instant
@@ -646,10 +656,7 @@ impl Deck {
                 self.underruns = underruns;
             }
         }
-        let mut taken: Vec<f64> = self
-            .ready
-            .drain(..wanted.min(self.ready.len()))
-            .collect();
+        let mut taken: Vec<f64> = self.ready.drain(..wanted.min(self.ready.len())).collect();
         taken.resize(wanted, 0.0);
         taken
     }
@@ -2738,9 +2745,7 @@ impl Future for PlayerInternal {
             let crossfade_lead_ms = match (planned_lead, self.crossfade().is_zero()) {
                 (Some(lead), _) => (lead + CROSSFADE_PRELOAD_SLACK).as_millis() as i64,
                 (None, true) => 0,
-                (None, false) => {
-                    (self.crossfade() + CROSSFADE_PRELOAD_SLACK).as_millis() as i64
-                }
+                (None, false) => (self.crossfade() + CROSSFADE_PRELOAD_SLACK).as_millis() as i64,
             };
 
             if let PlayerState::Playing {
@@ -3923,12 +3928,8 @@ impl PlayerInternal {
                 self.auto_normalise_as_album = setting
             }
 
-            PlayerCommand::SetCrossfade(crossfade) => {
-                self.crossfade = crossfade.min(CROSSFADE_MAX)
-            }
-            PlayerCommand::SetCrossfadePlan(plan) => {
-                self.plan = plan.map(CrossfadePlan::clamped)
-            }
+            PlayerCommand::SetCrossfade(crossfade) => self.crossfade = crossfade.min(CROSSFADE_MAX),
+            PlayerCommand::SetCrossfadePlan(plan) => self.plan = plan.map(CrossfadePlan::clamped),
             PlayerCommand::EmitFilterExplicitContentChangedEvent(filter) => {
                 self.send_event(PlayerEvent::FilterExplicitContentChanged { filter });
 
@@ -4255,18 +4256,17 @@ mod tests {
     use std::f64::consts::FRAC_1_SQRT_2;
     use std::time::Duration;
 
+    use super::IncomingCurve;
     use super::{
-        AudioPacket, AudioPacketPosition, BassShelf, BASS_SWAP_DEPTH_DB, BASS_SWAP_HZ,
-        CROSSFADE_MAX, CrossfadePlan, Decoder, Deck, NUM_CHANNELS, Outgoing, PROBE_STEP_SAMPLES,
+        AudioPacket, AudioPacketPosition, BASS_SWAP_DEPTH_DB, BASS_SWAP_HZ, BassShelf,
+        CROSSFADE_MAX, CrossfadePlan, Deck, Decoder, NUM_CHANNELS, Outgoing, PROBE_STEP_SAMPLES,
         Ramp, SAMPLE_RATE, Tail, apply_fade_in, crossfade_frames, curve_fits_overlap, mix_tail,
         mix_tail_with_bass, probe_step,
     };
-    use super::IncomingCurve;
-    use std::sync::Arc;
-    use crate::decoder::{AudioDecoder, DecoderError, DecoderResult};
     use super::{LoadError, PlayerEvent, PlayerTrackLoader};
     use crate::core::{Error, SpotifyUri, audio_key::AudioKeyError};
-
+    use crate::decoder::{AudioDecoder, DecoderError, DecoderResult};
+    use std::sync::Arc;
 
     #[test]
     fn only_an_explicit_audio_key_rejection_is_terminal() {
@@ -4294,7 +4294,6 @@ mod tests {
 
         assert_eq!(event.get_play_request_id(), Some(42));
     }
-
 
     struct StubDecoder {
         packets: Vec<Vec<f64>>,
@@ -4354,7 +4353,10 @@ mod tests {
     /// point of keylock: the deck plays the tail faster, so the same audio
     /// arrives sooner, but the pitch the listener hears must not move.
     fn dominant_frequency(samples: &[f64]) -> f64 {
-        let mono: Vec<f64> = samples.chunks(NUM_CHANNELS as usize).map(|f| f[0]).collect();
+        let mono: Vec<f64> = samples
+            .chunks(NUM_CHANNELS as usize)
+            .map(|f| f[0])
+            .collect();
         // The tail of the buffer is dropped: the deck pads its end with
         // silence once the track is behind it, and zero crossings through
         // silence say nothing about pitch. The head is kept, because the deck
@@ -4469,8 +4471,9 @@ mod tests {
     /// would have drifted apart.
     #[test]
     fn a_swept_tail_is_keylocked_even_though_it_starts_at_its_own_tempo() {
-        let decoder: Box<dyn AudioDecoder + Send> =
-            Box::new(StubDecoder { packets: vec![tone(220.0, 44_100)] });
+        let decoder: Box<dyn AudioDecoder + Send> = Box::new(StubDecoder {
+            packets: vec![tone(220.0, 44_100)],
+        });
         // Starts at 1.0, ends at 1.25: the shared-transition shape.
         let outgoing = Outgoing::new(decoder, 1.0, 4_096, 1.0, Some(1.25));
         assert!(
@@ -4478,7 +4481,6 @@ mod tests {
             "a tail that is swept must have a deck to sweep"
         );
     }
-
 
     /// The comparison that decides whether a rendered curve is used at all.
     ///
@@ -4509,10 +4511,7 @@ mod tests {
             !curve_fits_overlap(&curve(overlap as usize + 4_410), overlap),
             "a curve for another boundary must not be used"
         );
-        assert!(!curve_fits_overlap(
-            &curve(overlap as usize / 2),
-            overlap
-        ));
+        assert!(!curve_fits_overlap(&curve(overlap as usize / 2), overlap));
     }
 
     /// The whole point of the sweep, on the outgoing side: retargeting the
@@ -4981,8 +4980,10 @@ mod tests {
     #[test]
     fn a_plan_for_another_track_places_nothing() {
         use librespot_core::SpotifyUri;
-        let armed_for = SpotifyUri::from_uri("spotify:track:4uLU6hMCjMI75M1A2tKUQC").expect("a uri");
-        let skipped_to = SpotifyUri::from_uri("spotify:track:0aaKu1ym6qIuoIOsTH8uij").expect("a uri");
+        let armed_for =
+            SpotifyUri::from_uri("spotify:track:4uLU6hMCjMI75M1A2tKUQC").expect("a uri");
+        let skipped_to =
+            SpotifyUri::from_uri("spotify:track:0aaKu1ym6qIuoIOsTH8uij").expect("a uri");
         let plan = CrossfadePlan {
             duration: Duration::from_secs(3),
             fade_out_before_end: Duration::from_secs(9),
@@ -5006,7 +5007,8 @@ mod tests {
     #[test]
     fn a_plan_without_a_destination_places_nothing() {
         use librespot_core::SpotifyUri;
-        let skipped_to = SpotifyUri::from_uri("spotify:track:0aaKu1ym6qIuoIOsTH8uij").expect("a uri");
+        let skipped_to =
+            SpotifyUri::from_uri("spotify:track:0aaKu1ym6qIuoIOsTH8uij").expect("a uri");
         let plan = CrossfadePlan {
             duration: Duration::from_secs(3),
             fade_out_before_end: Duration::from_secs(9),
@@ -5053,4 +5055,3 @@ mod tests {
         assert_eq!(plan.fade_in_at, Duration::ZERO);
     }
 }
-

@@ -1601,7 +1601,9 @@ impl SpircTask {
             // only way to tell "the queue is empty" apart from "the ask never
             // reached the host", which otherwise look identical from a log.
             let (queued, first) = self.connect_state.next_track_probe();
-            debug!("preload: the queue has nothing for the ask ({queued} next track(s), first {first:?})");
+            debug!(
+                "preload: the queue has nothing for the ask ({queued} next track(s), first {first:?})"
+            );
         }
     }
 
