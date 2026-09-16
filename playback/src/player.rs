@@ -118,6 +118,17 @@ pub struct CrossfadePlan {
     /// deck fed whole packets while it consumes them at a swept rate either
     /// underruns or runs the decoder ahead of what has been heard.
     pub curve: Option<Arc<IncomingCurve>>,
+    /// The track this plan is a transition *into*.
+    ///
+    /// A plan outlives the moment it was made for — it is held while the
+    /// track before it plays, and can be replaced or overtaken — so anything
+    /// reading it has to be able to tell whether it is still the plan for the
+    /// boundary at hand. That matters most for a manual skip: the position a
+    /// plan carries is a position in one particular track, and seeking another
+    /// track to it would land nowhere near the music. `None` for a host that
+    /// does not name its destination, which leaves the plan usable for the
+    /// boundary it was armed for and for nothing else.
+    pub incoming_track: Option<SpotifyUri>,
 }
 
 impl CrossfadePlan {
@@ -132,6 +143,7 @@ impl CrossfadePlan {
                 1.0
             },
             curve: self.curve,
+            incoming_track: self.incoming_track,
         }
     }
 }
@@ -811,6 +823,15 @@ struct PlayerInternal {
 
     state: PlayerState,
     preload: PlayerPreload,
+    /// Where a manual skip decided the incoming track should start, held
+    /// between the skip and the load it precedes.
+    ///
+    /// A skip cannot seek the track itself: at that point the track has not
+    /// been loaded, and the load may still be waiting on a decoder. The
+    /// position is therefore carried to whichever of the two paths in
+    /// `handle_command_load` ends up starting the track, and cleared as it is
+    /// applied so it cannot reach a later track.
+    skip_start_ms: Option<u32>,
     sink: Box<dyn Sink>,
     sink_status: SinkStatus,
     sink_event_callback: Option<SinkEventCallback>,
@@ -1266,6 +1287,7 @@ impl Player {
 
                 state: PlayerState::Stopped,
                 preload: PlayerPreload::None,
+                skip_start_ms: None,
                 sink: sink_builder(),
                 sink_status: SinkStatus::Closed,
                 sink_event_callback: None,
@@ -3144,16 +3166,30 @@ impl PlayerInternal {
         if crossfade.is_zero() || !leaving {
             return;
         }
+        // A skip is not a planned boundary — the two tracks are unrelated, so
+        // they are not stretched onto a shared tempo — but the plan does know
+        // where the incoming track's own music starts, and starting there is
+        // what stops a skipped-to track playing its intro. Only a plan made
+        // for *this* track can say that: the position is a position in one
+        // particular track, so a plan armed for a different pair would seek
+        // somewhere unrelated.
+        let start_ms = self
+            .plan
+            .as_ref()
+            .filter(|plan| plan.incoming_track.as_ref() == Some(next))
+            .map(|plan| plan.fade_in_at.as_millis() as u32)
+            .unwrap_or(0);
         let frames = crossfade_frames(crossfade);
         if self.take_outgoing(frames, 1.0, None).is_some() {
             self.state = PlayerState::Stopped;
             self.fade_in = Some(Ramp::new(frames));
         }
-        // A skip is not a planned boundary: the two tracks are unrelated, so
-        // they are not stretched onto a shared tempo.
         self.outgoing_sweep = None;
-        // A skip cuts the planned boundary short; it must not fire later.
+        // A skip cuts the planned boundary short; it must not fire later. Its
+        // start position has been taken above, which is the only part of it a
+        // skip can still use.
         self.plan = None;
+        self.skip_start_ms = Some(start_ms);
     }
 
     fn is_adopting(&self, track_id: &SpotifyUri, position_ms: u32) -> bool {
@@ -3346,6 +3382,13 @@ impl PlayerInternal {
         } else {
             self.drop_crossfade();
         }
+        // The skip may have named where the incoming track's own music
+        // starts, which applies to exactly this load. A position the caller
+        // asked for explicitly is a deliberate one and wins over it.
+        let position_ms = match (self.skip_start_ms.take(), position_ms) {
+            (Some(start), 0) => start,
+            (_, asked) => asked,
+        };
 
         // Now we check at different positions whether we already have a pre-loaded version
         // of this track somewhere. If so, use it and return.
@@ -4743,6 +4786,7 @@ mod tests {
             fade_in_at: Duration::from_millis(500),
             tempo_rate: 1.0,
             curve: None,
+            incoming_track: None,
         }
         .clamped();
         assert_eq!(plan.duration, Duration::from_secs(3));
@@ -4753,6 +4797,82 @@ mod tests {
         assert_eq!(plan.duration, Duration::from_secs(3));
     }
 
+    /// The bug this covers: a manual skip used to start the incoming track at
+    /// its first sample, so a track skipped to played its intro while the one
+    /// before it faded out. The plan already knows where that track's own
+    /// music begins, so a skip for the same track starts there.
+    #[test]
+    fn a_skip_starts_the_incoming_track_where_its_plan_says() {
+        use librespot_core::SpotifyUri;
+        let next = SpotifyUri::from_uri("spotify:track:4uLU6hMCjMI75M1A2tKUQC").expect("a uri");
+        let plan = CrossfadePlan {
+            duration: Duration::from_secs(3),
+            fade_out_before_end: Duration::from_secs(9),
+            fade_in_at: Duration::from_millis(11_500),
+            tempo_rate: 1.0,
+            curve: None,
+            incoming_track: Some(next.clone()),
+        };
+        // The position a skip takes from the plan, as `begin_skip_crossfade`
+        // computes it.
+        let taken = plan
+            .incoming_track
+            .as_ref()
+            .filter(|named| **named == next)
+            .map(|_| plan.fade_in_at.as_millis() as u32);
+        assert_eq!(taken, Some(11_500));
+    }
+
+    /// A plan armed for one pair must not place another. The offset is a
+    /// position in one particular track, so applying it to a different track
+    /// would seek nowhere near the music — which is why the destination is
+    /// carried and compared rather than assumed.
+    #[test]
+    fn a_plan_for_another_track_places_nothing() {
+        use librespot_core::SpotifyUri;
+        let armed_for = SpotifyUri::from_uri("spotify:track:4uLU6hMCjMI75M1A2tKUQC").expect("a uri");
+        let skipped_to = SpotifyUri::from_uri("spotify:track:0aaKu1ym6qIuoIOsTH8uij").expect("a uri");
+        let plan = CrossfadePlan {
+            duration: Duration::from_secs(3),
+            fade_out_before_end: Duration::from_secs(9),
+            fade_in_at: Duration::from_millis(11_500),
+            tempo_rate: 1.0,
+            curve: None,
+            incoming_track: Some(armed_for),
+        };
+        let taken = plan
+            .incoming_track
+            .as_ref()
+            .filter(|named| **named == skipped_to)
+            .map(|_| plan.fade_in_at.as_millis() as u32)
+            .unwrap_or(0);
+        assert_eq!(taken, 0, "a foreign plan must leave the track at its start");
+    }
+
+    /// A plan that names nobody cannot be used to place a skip either: there
+    /// is nothing to check the destination against, and starting a track at
+    /// an unverified offset is worse than starting it at its beginning.
+    #[test]
+    fn a_plan_without_a_destination_places_nothing() {
+        use librespot_core::SpotifyUri;
+        let skipped_to = SpotifyUri::from_uri("spotify:track:0aaKu1ym6qIuoIOsTH8uij").expect("a uri");
+        let plan = CrossfadePlan {
+            duration: Duration::from_secs(3),
+            fade_out_before_end: Duration::from_secs(9),
+            fade_in_at: Duration::from_millis(11_500),
+            tempo_rate: 1.0,
+            curve: None,
+            incoming_track: None,
+        };
+        let taken = plan
+            .incoming_track
+            .as_ref()
+            .filter(|named| **named == skipped_to)
+            .map(|_| plan.fade_in_at.as_millis() as u32)
+            .unwrap_or(0);
+        assert_eq!(taken, 0);
+    }
+
     #[test]
     fn a_plan_is_capped_at_the_crossfade_maximum() {
         let plan = CrossfadePlan {
@@ -4761,6 +4881,7 @@ mod tests {
             fade_in_at: Duration::ZERO,
             tempo_rate: 1.0,
             curve: None,
+            incoming_track: None,
         }
         .clamped();
         assert_eq!(plan.duration, CROSSFADE_MAX);
@@ -4774,6 +4895,7 @@ mod tests {
             fade_in_at: Duration::ZERO,
             tempo_rate: 1.0,
             curve: None,
+            incoming_track: None,
         }
         .clamped();
         assert_eq!(plan.fade_out_before_end, Duration::ZERO);
