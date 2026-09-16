@@ -1,279 +1,275 @@
-> **This is a fork.** It is
-> [Cinnamobot/librespot](https://github.com/Cinnamobot/librespot), a fork of
-> [librespot-org/librespot](https://github.com/librespot-org/librespot) that
-> adds the crossfade machinery
-> [Fastpotify](https://github.com/Cinnamobot/fastpotify)'s automix needs.
-> **For librespot itself — what it is, how to install and use it, its options,
-> its audio backends, and its releases — read the upstream project's
-> documentation.** Everything this fork adds is under
-> [Cinnamobot/librespot — the `fastpotify-automix` branch](#cinnamobotlibrespot--the-fastpotify-automix-branch)
-> below.
+# librespot <sub>+ automix</sub>
 
-[![Build Status](https://github.com/librespot-org/librespot/workflows/build/badge.svg)](https://github.com/librespot-org/librespot/actions)
-[![Gitter chat](https://badges.gitter.im/librespot-org/librespot.png)](https://gitter.im/librespot-org/spotify-connect-resources)
-[![Crates.io](https://img.shields.io/crates/v/librespot.svg)](https://crates.io/crates/librespot)
+**[librespot-org/librespot](https://github.com/librespot-org/librespot) の
+フォークです。** ライブラリ本体 — インストール、使い方、オプション、音声
+バックエンド、対応プラットフォーム、リリース — は**すべて本家の成果物**です。
+**それらについては本家を読んでください。**
 
-Current maintainers are [listed on GitHub](https://github.com/orgs/librespot-org/people).
+> **→ [librespot-org/librespot の README](https://github.com/librespot-org/librespot#readme)**
+> **→ [本家の Wiki](https://github.com/librespot-org/librespot/wiki)**(使い方・オプション)
+> **→ [COMPILING.md](https://github.com/librespot-org/librespot/blob/master/COMPILING.md)**(ビルド手順)
 
-# librespot
-*librespot* is an open source client library for Spotify. It enables applications to use Spotify's service to control and play music via various backends, and to act as a Spotify Connect receiver. It is an alternative to the official and [now deprecated](https://pyspotify.mopidy.com/en/latest/#libspotify-s-deprecation) closed-source `libspotify`. Additionally, it will provide extra features which are not available in the official library.
+このフォークが足すのは、**[Fastpotify](https://github.com/Cinnamobot/fastpotify)**
+の automix が使う**遷移(トランジション)機構**です。本家には存在しません。
+以下はその説明です。
 
-_Note: librespot only works with Spotify Premium. This will remain the case. We will not support any features to make librespot compatible with free accounts, such as limited skips and adverts._
+---
 
-## Quick start
-We're available on [crates.io](https://crates.io/crates/librespot) as the _librespot_ package. Simply run `cargo install librespot` to install librespot on your system. Check the wiki for more info and possible [usage options](https://github.com/librespot-org/librespot/wiki/Options).
+## 何を足すのか
 
-After installation, you can run librespot from the CLI using a command such as `librespot -n "Librespot Speaker" -b 160` to create a speaker called _Librespot Speaker_ serving 160 kbps audio.
+本家の再生はギャップレスです。前の曲が終わり次第、次の曲が**1サンプル目から**
+鳴ります。2曲が同時に鳴ることはありません。
 
-## This fork
-As the origin by [plietar](https://github.com/plietar/) is no longer actively maintained, this organisation and repository have been set up so that the project may be maintained and upgraded in the future.
+automix は**2曲を意図的に重ねます**。そのためには、ホスト(クライアント)が
+**場所とタイミングを指定**できる必要があります。
 
-## Cinnamobot/librespot — the `fastpotify-automix` branch
+```
+本家     前の曲 ██████████████│次の曲 ██████████████
+                              ↑ ここで切れる。重ならない
 
-**This repository is a fork of
-[librespot-org/librespot](https://github.com/librespot-org/librespot).** The
-library, its crates, its audio backends, its documentation, and its release
-process are the upstream project's work. Where anything below looks like it
-describes librespot itself, the upstream README and wiki are the authority, and
-this file does not restate them.
+automix  前の曲 ██████████████▓▓▓▓▓▓▓▓╗
+                              ↑ ここから抜ける
+             次の曲 ░░░░░░░░░░░░░░▓▓▓▓▓▓▓▓╝
+                                  ↑ ここから鳴る
+```
 
-The branch `fastpotify-automix` carries what one client needs beyond the
-release, for **[Fastpotify](https://github.com/Cinnamobot/fastpotify)**'s
-automix: transitions between tracks that are planned rather than timed. It is
-not intended to be merged as a whole, and it does not change default
-behaviour — a host that never sets a crossfade plan gets exactly upstream
-playback.
+**この「重なり」を成立させるのがこのフォークの役割**です。どこで繋ぐかの判断は
+Fastpotify 側が行い、フォークは**指定された通りに鳴らす**ことに責任を持ちます。
 
-### What is not this fork's work
+---
 
-The base crossfade is a **cherry-pick of
-[librespot-org/librespot#1756](https://github.com/librespot-org/librespot/pull/1756)**,
-"feat(playback): crossfade between tracks" by
-[@revolutionxk](https://github.com/revolutionxk), which is still open upstream.
-That PR is where the second decoder, the equal-power ramp, the mixing before
-the sink, and `PlayerConfig::crossfade` come from; this branch only replayed it
-onto the fork's own changes. **It remains the right place to discuss that
-mechanism**, and this fork's commits should not be read as a competing
-implementation of it.
+## 中心となる API
 
-Everything the branch adds on top — planning the overlap, matching tempo,
-choosing where each track enters and leaves, the events a host needs to drive
-that — is described below.
-
-### What the branch adds
-
-**A planned overlap.** Upstream fades on a timer, between two tracks that are
-otherwise unrelated. `CrossfadePlan` lets a host say where the outgoing track
-should start leaving, how long the overlap runs, and where in the incoming
-track it should begin. The player fires the overlap on that timing.
+### `CrossfadePlan` — ホストが行き先を指定する
 
 ```rust
 pub struct CrossfadePlan {
-    pub duration: Duration,             // overlap length
-    pub fade_out_before_end: Duration,  // where the exit starts
-    pub fade_in_at: Duration,           // where the incoming track starts
-    pub tempo_rate: f64,                // the pair's tempo ratio, pitch held
+    pub duration: Duration,             // 重なりの長さ
+    pub fade_out_before_end: Duration,  // 前の曲の終わりから何秒前で抜け始めるか
+    pub fade_in_at: Duration,           // 次の曲のどこから鳴らすか
+    pub tempo_rate: f64,                // テンポ比(ピッチは保持)
     pub curve: Option<Arc<IncomingCurve>>,
     pub incoming_track: Option<SpotifyUri>,
 }
 ```
 
-`incoming_track` names the track the plan is a transition *into*. A plan
-outlives the moment it was made for — it is held while the previous track
-plays, and can be replaced or overtaken — so anything acting on it has to be
-able to tell whether it is still the plan for the boundary at hand. That
-matters most for a manual skip: the position a plan carries is a position in
-one particular track, and seeking a different track to it would land nowhere
-near the music.
+本家の `crossfade` は**長さだけ**でした。`CrossfadePlan` は**場所**を加えます。
 
-**Tempo matching, pitch held.** The outgoing tail can be keylocked to the
-incoming track's tempo, and the two decks can *share* the stretch rather than
-one carrying all of it — a pair 26% apart would otherwise be swept 26% on a
-single deck, past the point where keylock stays fully pitch-correct. The
-incoming deck's half is rendered ahead of the boundary and played as a curve,
-rather than run live: a deck fed whole packets while it consumes them at a
-swept rate either underruns or runs its decoder ahead of what has been heard.
+| フィールド | 意味 |
+|---|---|
+| `duration` | 重なりの実時間 |
+| `fade_out_before_end` | 前の曲の**終わりからの逆算**。曲末が基準 |
+| `fade_in_at` | **次の曲の中の絶対位置**。ここから鳴らす |
+| `tempo_rate` | 伸縮比。`curve` がある場合は**終点**の値 |
+| `incoming_track` | **この遷移先の曲名** |
 
-**A bass handover.** Two tracks overlapping share their bass, and bass is where
-the mud is. A shelf at 200 Hz moves the low end from one deck to the other
-across the overlap, so only one of them owns it at a time.
+### `incoming_track` が必要な理由
 
-**Events a host needs before the preload.**
+**プランは作られた瞬間より長く生き残ります。** 前の曲が鳴っている間ずっと保持され、
+差し替えられたり追い越されたりします。だからプランを読む側は、
+**それが今の境界のためのプランなのか**を判定できなければなりません。
 
-- `PlayerEvent::UpcomingTrack` — the track that will play next, raised as soon
-  as the queue knows one. `TimeToPreloadNextTrack` cannot serve this: it fires
-  once the current track is nearly over, because it exists to have the *audio*
-  ready in time, whereas a host that wants to look something up about the next
-  track needs only its identity, and can have it much earlier.
-- `PlayerEvent::IncomingPreloaded` — a short probe of the incoming track's
-  audio. Only the outgoing track reaches the sink, so this is how a host gets a
-  grid for a track that never plays through the mixer.
+特に**手動スキップ**でこれが効きます。プランが運ぶ位置は**特定の1曲の中の位置**なので、
+別の曲に適用すると**音楽と全く関係ない場所**にシークしてしまいます。名前を照合して
+一致した時だけ適用することで、これを防ぎます。
 
-**A probe that cannot stall playback.** The probe runs on the same thread as
-the loop that feeds the sink, and `AudioFileStreaming::read` blocks on a
-condition variable until the bytes it was asked for have arrived. A step taken
-before the fetch had caught up therefore stalled the playing track for as long
-as the CDN took — measured at a median of 137 ms and a worst case of seconds,
-against a sink holding a fraction of that. `StreamLoaderController::read_is_ready`
-lets the step be deferred instead.
+```
+プラン: 「spotify:track:AAA の 20.73s から鳴らす」
+                    │
+        スキップ先と一致する? ── yes ──→ 20.73s から開始
+                    │
+                    no ──→ 0s から開始(従来どおり)
+```
 
-**A preload ask that can be repeated.** `TimeToPreloadNextTrack` is raised once
-per track, and answered with whatever the queue holds at that instant. A track
-started from a single-track context is the case that goes wrong: the queue is
-still empty when the ask goes out and is filled a moment later, so the ask is
-spent with nothing to preload. The ask is now repeated while nothing arrives,
-bounded so an empty queue does not produce a command every couple of seconds
-for the life of a track.
+---
 
-**Fixes found by running it for hours.** An audio output device that goes away
-— an unplugged headset, a machine waking from sleep — pauses the player, which
-the state machine read as a broken state and answered with `exit(1)`. A
-`spotify:delimiter` marker at the head of the queue was taken for the next
-track, so a preload ask was answered with a URI nothing can be loaded from and
-the boundary arrived with nothing to mix in.
+## タイムライン — 両デッキがテンポを共有する
 
-### Using it
+重なりの間、**2つのデッキは同じ実効テンポを共有**します。テンポは前の曲のものから
+次の曲のものへ**滑らかに滑ります**。
 
-Every librespot crate must come from this branch, so one copy exists:
+```
+実時間 →    0s                    5.22s                 10.44s
+            │                     │                     │
+共有テンポ  92.00 BPM             95.43 BPM             98.99 BPM
+            │                     │                     │
+前の曲      262.58s               267.90s               273.41s
+  レート    1.000x                1.037x                1.076x
+  ゲイン    1.00                  0.71                  0.00   (cos)
+            │                     │                     │
+次の曲      20.73s                25.67s                30.80s
+  レート    0.929x                0.964x                1.000x
+  ゲイン    0.00                  0.71                  1.00   (sin)
+```
+
+**始点では両方が前の曲のテンポ、終点では両方が次の曲のテンポ**です。途中も常に
+一致します — 前の曲を `ratio^p`、次の曲を `ratio^(p-1)` で走らせると、実効テンポは
+どちらも `out_bpm × ratio^p` になるからです。
+
+> 📌 **聴いている側の曲は、遷移の最初と最後で自然なテンポのままです。**
+> 始点では前の曲が自分のテンポ(1.0x)、終点では次の曲が自分のテンポ(1.0x)。
+> 伸縮は2つのデッキの間を**移っていく**だけで、どちらもロックされたままです。
+>
+> 直線的なランプではこれが成立しません。`1.0` から始まって `1/ratio` で終わる直線と、
+> `ratio` から始まって `1.0` で終わる直線は、商が一定になりません。**幾何級数
+> (geometric)だけがこの形を作れます。**
+
+### ピッチは保持される
+
+`tempo_rate` の伸縮は **keylock** を通します。テンポが変わっても**ピッチは変わりません**。
+`EngineProfile::Keylock` のデッキが回路の終端まで準備されます。
+
+### フェード形状は等パワー
+
+`cos` / `sin` の等パワーです。**線形だと重なりの中央で約3 dB 落ちます** —
+別々の曲は相関がないので、線形フェードは音量が下がって聞こえます。
+
+`Ramp` は最初のフレームを始点、最後のフレームを終点として扱うので、
+**カーブはちょうど 0 と 1 に到達します**。そうしないと次の曲がフルレベルに
+届かず、前の曲がまだ聞こえるうちに切れます。
+
+---
+
+## 入場側は事前レンダリング
+
+次の曲の伸縮は、**境界の手前でレンダリング**して `IncomingCurve` として
+再生します。ライブで走らせない理由があります。
+
+```
+ライブで走らせる場合:
+  デコーダ ── パケット単位で供給 ──→ デッキ ── 掃引レートで消費 ──→ sink
+                    ↑
+              供給できるループは位置報告ループだけ
+              → アンダーラン か デコーダが聴取位置を追い越す
+
+事前レンダリングの場合:
+  デコーダ ──→ デッキ(オフライン) ──→ 完成したバッファ ──→ sink
+                                        ↑
+                                  期限がない。追い越しが起きない
+```
+
+オフラインなら**期限がありません**。ソースは空きがあるまで押し込まれ、レンダリングは
+重なりが埋まるまで引かれます。**両者が相手を追い越せない**という構造です。
+
+`IncomingCurve` は**消費したフレーム数**も持ちます。デコーダは自分のレートで
+パケット単位に要求されるため、重なりの終わりには**聴取位置より先へ進んでいます**。
+その差がこれで、**レンダリングの性質として閉じた形**で求まります(再導出しません)。
+
+---
+
+## ホストが必要とするイベント
+
+automix は**次の曲の情報を、音声より早く**必要とします。
+
+### `UpcomingTrack` — 次に鳴る曲を、キューが知った時点で
+
+```
+本家          曲末が近づく ──→ 発火
+                           ↑ 音声を用意する時間しかない
+
+このフォーク  キューが次曲を知る ──→ 発火
+                                  ↑ 調べる時間が十分ある
+```
+
+`TimeToPreloadNextTrack` は**音声**を時間内に用意するためのものなので、曲がほぼ
+終わるまで発火しません。**次曲の正体だけ**を知りたいホストは、もっと早くから
+知ることができます。
+
+### `IncomingPreloaded` — 次曲の短いプローブ
+
+**sink には前の曲しか届きません。** 次に鳴る曲は一度もミキサーを通らないので、
+その曲の音声を解析する手段が別に必要です。これがその手段で、
+**プローブした音声とその位置**を運びます。
+
+### `read_is_ready` — 音声スレッドを止めない
+
+プローブは **sink を供給しているのと同じスレッド**で走ります。そして
+`AudioFileStreaming::read` は**要求したバイトが届くまで Condvar でブロック**します。
+到着前にステップを踏むと、**再生中の曲が CDN の応答時間ぶん止まります**。
+
+```
+未到着のまま read ──→ Condvar で待つ ──→ sink が枯れる ──→ 音が切れる
+                  ↑
+                  実測: 中央値 137 ms、最悪数秒
+
+read_is_ready が false  ──→ そのステップを踏まず次の周回へ
+```
+
+### プリロード要求の再試行
+
+`TimeToPreloadNextTrack` は**1曲につき1回**しか上がりません。受け手が答えられない
+瞬間があると、**その曲のプリロードは永久に失われます**。
+
+実際に起きたのは**単曲を再生した場合**です。キューの先頭に区切りマーカーが入り、
+`spotify:delimiter` は**どの曲にも解釈できない**ので、要求は消費されて何も
+プリロードされません。要求を出したのに何も届かなければ、**2秒間隔で最大8回**まで
+再要求します(上限があるのは、文脈の最後の曲には本当に次が無いためです)。
+
+---
+
+## 帰属
+
+> **基底のクロスフェードは本フォークの成果ではありません。**
+> [librespot-org/librespot#1756](https://github.com/librespot-org/librespot/pull/1756)
+> "feat(playback): crossfade between tracks"(@revolutionxk、本家でオープン中)
+> のチェリーピックです。
+>
+> **2つ目のデコーダ、等パワーランプ、sink 手前でのミックス、
+> `PlayerConfig::crossfade` はその PR の成果です。** 本フォークはそれを
+> 自分の変更の上に載せ直しただけです。**機構そのものの議論は本家 PR が
+> 適切な場所です。**
+
+このフォークが追加するのは、その上に載る**計画とタイミング**の層です。
+
+---
+
+## 使い方
+
+librespot のクレートは**すべてこのフォークから**取る必要があります
+(1つのコピーしか存在できないため)。
 
 ```toml
 [patch.crates-io]
-librespot-audio    = { git = "https://github.com/Cinnamobot/librespot", branch = "fastpotify-automix" }
-librespot-connect  = { git = "https://github.com/Cinnamobot/librespot", branch = "fastpotify-automix" }
-librespot-core     = { git = "https://github.com/Cinnamobot/librespot", branch = "fastpotify-automix" }
-librespot-metadata = { git = "https://github.com/Cinnamobot/librespot", branch = "fastpotify-automix" }
-librespot-oauth    = { git = "https://github.com/Cinnamobot/librespot", branch = "fastpotify-automix" }
-librespot-playback = { git = "https://github.com/Cinnamobot/librespot", branch = "fastpotify-automix" }
-librespot-protocol = { git = "https://github.com/Cinnamobot/librespot", branch = "fastpotify-automix" }
+librespot-audio    = { git = "https://github.com/Cinnamobot/librespot", branch = "main" }
+librespot-connect  = { git = "https://github.com/Cinnamobot/librespot", branch = "main" }
+librespot-core     = { git = "https://github.com/Cinnamobot/librespot", branch = "main" }
+librespot-metadata = { git = "https://github.com/Cinnamobot/librespot", branch = "main" }
+librespot-oauth    = { git = "https://github.com/Cinnamobot/librespot", branch = "main" }
+librespot-playback = { git = "https://github.com/Cinnamobot/librespot", branch = "main" }
+librespot-protocol = { git = "https://github.com/Cinnamobot/librespot", branch = "main" }
 ```
 
-`Cargo.lock` pins the revision, so the resolution is reproducible.
+`Cargo.lock` がリビジョンを固定するので、解決は再現します。
 
-**The quality workflow does not run on this branch** — upstream's `quality.yml`
-and `build.yml` trigger on `dev` and `master` only. Before pushing a change
-here, run what those jobs would:
+> ⚠️ **本家の品質ワークフローはこのフォークでは走りません。**
+> 本家の `quality.yml` / `build.yml` は `dev` と `master` だけを対象にしています。
+> 変更を push する前に、そのジョブが走らせるものを手元で実行してください:
+>
+> ```shell
+> cargo fmt --all --check
+> cargo clippy --all-targets -- -D warnings
+> cargo test
+> ```
 
-```shell
-cargo fmt --all --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-```
+---
 
-### Where the changes are
+## 変更箇所
 
-| Crate | What it holds |
+| クレート | 内容 |
 |---|---|
-| `playback/src/player.rs` | `CrossfadePlan`, the deck, the stretch and bass handover, the probe, the events |
-| `audio/src/fetch/mod.rs` | `read_is_ready`, so a probe step can be deferred |
-| `connect/src/spirc.rs` | Raises `UpcomingTrack` when the queue moves |
-| `connect/src/state/tracks.rs` | Names the next *playable* track, skipping the queue's delimiter |
-| `protocol/build.rs` | Compiles `cuepoints.proto`, the automix cuepoints the client reads |
+| `playback/src/player.rs` | `CrossfadePlan`、デッキ、伸縮、ベース受け渡し、プローブ、イベント |
+| `audio/src/fetch/mod.rs` | `read_is_ready`(プローブのステップを後回しにする) |
+| `connect/src/spirc.rs` | キューが動いた時に `UpcomingTrack` を上げる |
+| `connect/src/state/tracks.rs` | 次に**鳴らせる**曲を返す(区切りマーカーを飛ばす) |
+| `protocol/build.rs` | `cuepoints.proto`(automix のキュー)をコンパイルする |
 
-Changes are kept as separate commits with their measurements, so any one of
-them can be dropped or sent upstream on its own. Patches upstream takes should
-be dropped from this branch as they land.
+変更は**計測値つきの個別コミット**として保たれているので、どれか1つを外したり、
+本家へ個別に送ったりできます。本家が取り込んだパッチは、取り込まれた時点で
+このフォークから外してください。
 
-# Documentation
-Documentation is currently a work in progress, contributions are welcome!
+---
 
-There is some brief documentation on how the protocol works in the [docs](https://github.com/librespot-org/librespot/tree/master/docs) folder.
+## ライセンス
 
-[COMPILING.md](https://github.com/librespot-org/librespot/blob/master/COMPILING.md) contains detailed instructions on setting up a development environment, and compiling librespot. More general usage and compilation information is available on the [wiki](https://github.com/librespot-org/librespot/wiki).
-[CONTRIBUTING.md](https://github.com/librespot-org/librespot/blob/master/CONTRIBUTING.md) also contains our contributing guidelines.
-
-If you wish to learn more about how librespot works overall, the best way is to simply read the code, and ask any questions you have in our [Gitter Room](https://gitter.im/librespot-org/spotify-connect-resources).
-
-# Issues & Discussions
-**We have recently started using Github discussions for general questions and feature requests, as they are a more natural medium for such cases, and allow for upvoting to prioritize feature development. Check them out [here](https://github.com/librespot-org/librespot/discussions). Bugs and issues with the underlying library should still be reported as issues.**
-
-If you run into a bug when using librespot, please search the existing issues before opening a new one. Chances are, we've encountered it before, and have provided a resolution. If not, please open a new one, and where possible, include the backtrace librespot generates on crashing, along with anything we can use to reproduce the issue, e.g. the Spotify URI of the song that caused the crash.
-
-# Building
-A quick walkthrough of the build process is outlined below, while a detailed compilation guide can be found [here](https://github.com/librespot-org/librespot/blob/master/COMPILING.md).
-
-## Additional Dependencies
-We recently switched to using [Rodio](https://github.com/tomaka/rodio) for audio playback by default, hence for macOS and Windows, you should just be able to clone and build librespot (with the command below).
-For Linux, you will need to run the additional commands below, depending on your distro.
-
-On Debian/Ubuntu, the following command will install these dependencies:
-```shell
-sudo apt-get install build-essential libasound2-dev
-```
-
-On Fedora systems, the following command will install these dependencies:
-```shell
-sudo dnf install alsa-lib-devel make gcc
-```
-
-librespot currently offers the following selection of [audio backends](https://github.com/librespot-org/librespot/wiki/Audio-Backends):
-```
-Rodio (default)
-ALSA
-GStreamer
-PortAudio
-PulseAudio
-JACK
-JACK over Rodio
-SDL
-Pipe
-Subprocess
-```
-Please check [COMPILING.md](COMPILING.md) for detailed information on TLS, audio, and discovery backend dependencies, or the [Compiling](https://github.com/librespot-org/librespot/wiki/Compiling#general-dependencies) entry on the wiki for additional backend specific dependencies.
-
-Once you've installed the dependencies and cloned this repository you can build *librespot* with the default features using Cargo.
-```shell
-cargo build --release
-```
-
-By default, this builds with native-tls (system TLS), rodio audio backend, and libmdns discovery. See [COMPILING.md](COMPILING.md) for information on selecting different TLS, audio, and discovery backends.
-
-# Packages
-
-librespot is also available via official package system on various operating systems such as Linux, FreeBSD, NetBSD. [Repology](https://repology.org/project/librespot/versions) offers a good overview.
-
-[![Packaging status](https://repology.org/badge/vertical-allrepos/librespot.svg)](https://repology.org/project/librespot/versions)
-
-## Usage
-A sample program implementing a headless Spotify Connect receiver is provided.
-Once you've built *librespot*, run it using :
-```shell
-target/release/librespot --name DEVICENAME
-```
-
-The above is a minimal example. Here is a more fully fledged one:
-```shell
-target/release/librespot -n "Librespot" -b 320 -c ./cache --enable-volume-normalisation --initial-volume 75 --device-type avr
-```
-The above command will create a receiver named ```Librespot```, with bitrate set to 320 kbps, initial volume at 75%, with volume normalisation enabled, and the device displayed in the app as an Audio/Video Receiver. A folder named ```cache``` will be created/used in the current directory, and be used to cache audio data and credentials.
-
-A full list of runtime options is available [here](https://github.com/librespot-org/librespot/wiki/Options).
-
-_Please Note: When using the cache feature, an authentication blob is stored for your account in the cache directory. For security purposes, we recommend that you set directory permissions on the cache directory to `700`._
-
-## Contact
-Come and hang out on gitter if you need help or want to offer some:
-https://gitter.im/librespot-org/spotify-connect-resources
-
-## Disclaimer
-Using this code to connect to Spotify's API is probably forbidden by them.
-Use at your own risk.
-
-## License
-Everything in this repository is licensed under the MIT license.
-
-## Related Projects
-This is a non exhaustive list of projects that either use or have modified librespot. If you'd like to include yours, submit a PR.
-
-- [librespot-golang](https://github.com/librespot-org/librespot-golang) - A golang port of librespot.
-- [plugin.audio.spotify](https://github.com/marcelveldt/plugin.audio.spotify) - A Kodi plugin for Spotify.
-- [raspotify](https://github.com/dtcooper/raspotify) - A Spotify Connect client that mostly Just Works™
-- [Spotifyd](https://github.com/Spotifyd/spotifyd) - A stripped down librespot UNIX daemon.
-- [rpi-audio-receiver](https://github.com/nicokaiser/rpi-audio-receiver) - easy Raspbian install scripts for Spotifyd, Bluetooth, Shairport and other audio receivers
-- [Spotcontrol](https://github.com/badfortrains/spotcontrol) - A golang implementation of a Spotify Connect controller. No Playback functionality.
-- [librespot-java](https://github.com/devgianlu/librespot-java) - A Java port of librespot.
-- [ncspot](https://github.com/hrkfdn/ncspot) - Cross-platform ncurses Spotify client.
-- [ansible-role-librespot](https://github.com/xMordax/ansible-role-librespot/tree/master) - Ansible role that will build, install and configure Librespot.
-- [Spot](https://github.com/xou816/spot) - Gtk/Rust native Spotify client for the GNOME desktop.
-- [Snapcast](https://github.com/badaix/snapcast) - synchronised multi-room audio player that uses librespot as its source for Spotify content
-- [MuPiBox](https://mupibox.de/) - Portable music box for Spotify and local media based on Raspberry Pi. Operated via touchscreen. Suitable for children and older people.
-- [RoPieee](https://ropieee.org) - An easy-to-use Raspberry Pi image for network audio streaming solutions.
+本家 [librespot-org/librespot](https://github.com/librespot-org/librespot) と
+同じ MIT です。Spotify とは無関係です。Spotify は Spotify AB の商標です。
