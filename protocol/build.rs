@@ -45,6 +45,9 @@ fn compile() {
         proto_dir.join("transfer_state.proto"),
         proto_dir.join("context_player_options.proto"),
         proto_dir.join("playback.proto"),
+        // The per-track automix cuepoints: where the official client brings a
+        // track in and takes it out, with the tempo it does it at.
+        proto_dir.join("cuepoints.proto"),
         proto_dir.join("play_history.proto"),
         proto_dir.join("session.proto"),
         proto_dir.join("queue.proto"),
