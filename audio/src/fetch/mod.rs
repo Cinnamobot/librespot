@@ -190,6 +190,29 @@ impl StreamLoaderController {
         }
     }
 
+    /// Whether a read of `length` bytes from the current read position is
+    /// already fetched, and so cannot block.
+    ///
+    /// [`AudioFileStreaming::read`] waits on a condition variable until the
+    /// bytes it was asked for have arrived. A caller that shares its thread
+    /// with something time-critical — the audio path, for instance — can ask
+    /// this first and come back on a later pass rather than stall. A cached
+    /// or local file is complete before anything reads it, so it is always
+    /// ready.
+    pub fn read_is_ready(&self, length: usize) -> bool {
+        match &self.stream_shared {
+            Some(shared) => {
+                let start = shared.read_position();
+                // `range_available` reaches into the file's extent, so an
+                // over-long read at the very end is answered here rather than
+                // by a subtraction that could go under.
+                start.saturating_add(length) <= self.len()
+                    && self.range_available(Range::new(start, length))
+            }
+            None => true,
+        }
+    }
+
     pub fn ping_time(&self) -> Option<Duration> {
         self.stream_shared.as_ref().map(|shared| shared.ping_time())
     }
@@ -685,5 +708,74 @@ impl Seek for AudioFile {
             AudioFile::Cached(ref mut file) => file.seek(pos),
             AudioFile::Streaming(ref mut file) => file.seek(pos),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// A streaming file with `fetched` bytes available from the start.
+    fn streaming(file_size: usize, fetched: usize) -> StreamLoaderController {
+        let mut downloaded = RangeSet::new();
+        downloaded.add_range(&Range::new(0, fetched.min(file_size)));
+        let shared = Arc::new(AudioFileShared {
+            cdn_url: String::new(),
+            file_size,
+            bytes_per_second: 40_000,
+            cond: Condvar::new(),
+            download_status: Mutex::new(AudioFileDownloadStatus {
+                requested: RangeSet::new(),
+                downloaded,
+            }),
+            download_streaming: AtomicBool::new(true),
+            download_slots: Semaphore::new(1),
+            ping_time_ms: AtomicUsize::new(0),
+            read_position: AtomicUsize::new(0),
+            throughput: AtomicUsize::new(0),
+        });
+        StreamLoaderController {
+            channel_tx: None,
+            stream_shared: Some(shared),
+            file_size,
+        }
+    }
+
+    /// The bug this covers: the probe ran on the same thread as the loop that
+    /// feeds the sink, and `AudioFileStreaming::read` blocks on a condition
+    /// variable until the bytes it was asked for have arrived. A step taken
+    /// before the fetch had caught up therefore stalled the playing track for
+    /// as long as the CDN took — measured at a median 137 ms and a worst case
+    /// of seconds, against a sink that holds a fraction of that.
+    #[test]
+    fn a_read_is_only_ready_once_its_bytes_have_arrived() {
+        let controller = streaming(1_000_000, 16_384);
+
+        assert!(
+            controller.read_is_ready(8 * 1024),
+            "the first 8 KiB are fetched, so a read of them cannot block"
+        );
+        assert!(
+            controller.read_is_ready(16_384),
+            "and exactly up to what has arrived"
+        );
+        assert!(
+            !controller.read_is_ready(16_385),
+            "one byte past what has arrived would have to wait, so it is not ready"
+        );
+    }
+
+    /// A local or fully fetched file cannot block, so it is always ready —
+    /// otherwise every step of every probe would be refused when playback is
+    /// from the cache.
+    #[test]
+    fn a_complete_file_is_always_ready_to_read() {
+        let controller = streaming(100_000, 100_000);
+        assert!(controller.read_is_ready(99_999));
+        assert!(
+            !controller.read_is_ready(100_001),
+            "a read past the end is not a read the file can answer"
+        );
     }
 }
