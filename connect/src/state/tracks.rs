@@ -373,7 +373,7 @@ impl<'ct> ConnectState {
             let uri = self.current_track(|t| t.uri.clone());
             return SpotifyUri::from_uri(&uri).ok();
         }
-        let uri = next_playable(&self.next_tracks())?;
+        let uri = next_playable(self.next_tracks())?;
         SpotifyUri::from_uri(uri).ok()
     }
 

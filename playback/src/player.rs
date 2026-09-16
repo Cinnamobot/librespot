@@ -671,17 +671,6 @@ impl Drop for Deck {
     }
 }
 
-fn mix_tail(samples: &mut [f64], tail: &[f64], ramp: &mut Ramp) {
-    let channels = NUM_CHANNELS as usize;
-    for (frame, tail_frame) in samples.chunks_mut(channels).zip(tail.chunks(channels)) {
-        let gain = ramp.out_gain();
-        for (sample, tail_sample) in frame.iter_mut().zip(tail_frame) {
-            *sample += tail_sample * gain;
-        }
-        ramp.advance();
-    }
-}
-
 /// Where the outgoing deck's samples come from: the decoder as it was, or
 /// a keylocked deck playing the tail at the transition's rate.
 enum Tail {
@@ -2490,17 +2479,10 @@ impl Future for PlayerInternal {
                 // sink — which is the gap this whole design exists to avoid.
                 // Waiting costs nothing: the playing track is decoded on this
                 // same pass either way.
-                if !loaded_track
+                let ready = loaded_track
                     .stream_loader_controller
-                    .read_is_ready(PROBE_STEP_READ_BYTES)
-                {
-                    self.preload = PlayerPreload::Probing {
-                        track_id,
-                        loaded_track,
-                        samples,
-                        position_ms,
-                    };
-                } else if probe_step(&mut loaded_track.decoder, &mut samples) {
+                    .read_is_ready(PROBE_STEP_READ_BYTES);
+                if !ready || probe_step(&mut loaded_track.decoder, &mut samples) {
                     self.preload = PlayerPreload::Probing {
                         track_id,
                         loaded_track,
@@ -4260,7 +4242,7 @@ mod tests {
     use super::{
         AudioPacket, AudioPacketPosition, BASS_SWAP_DEPTH_DB, BASS_SWAP_HZ, BassShelf,
         CROSSFADE_MAX, CrossfadePlan, Deck, Decoder, NUM_CHANNELS, Outgoing, PROBE_STEP_SAMPLES,
-        Ramp, SAMPLE_RATE, Tail, apply_fade_in, crossfade_frames, curve_fits_overlap, mix_tail,
+        Ramp, SAMPLE_RATE, Tail, apply_fade_in, crossfade_frames, curve_fits_overlap,
         mix_tail_with_bass, probe_step,
     };
     use super::{LoadError, PlayerEvent, PlayerTrackLoader};
@@ -4870,16 +4852,6 @@ mod tests {
         }
         assert!(samples[0].abs() < 1e-9);
         assert!(samples[6] > samples[4]);
-        assert!(ramp.finished());
-    }
-
-    #[test]
-    fn tail_is_mixed_frame_for_frame() {
-        let mut ramp = Ramp::new(4);
-        let mut samples = vec![0.0f64; 8];
-        mix_tail(&mut samples, &vec![1.0f64; 8], &mut ramp);
-        assert!((samples[0] - 1.0).abs() < 1e-9);
-        assert!(samples[6] < samples[4]);
         assert!(ramp.finished());
     }
 
