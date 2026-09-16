@@ -1,3 +1,14 @@
+> **This is a fork.** It is
+> [Cinnamobot/librespot](https://github.com/Cinnamobot/librespot), a fork of
+> [librespot-org/librespot](https://github.com/librespot-org/librespot) that
+> adds the crossfade machinery
+> [Fastpotify](https://github.com/Cinnamobot/fastpotify)'s automix needs.
+> **For librespot itself — what it is, how to install and use it, its options,
+> its audio backends, and its releases — read the upstream project's
+> documentation.** Everything this fork adds is under
+> [Cinnamobot/librespot — the `fastpotify-automix` branch](#cinnamobotlibrespot--the-fastpotify-automix-branch)
+> below.
+
 [![Build Status](https://github.com/librespot-org/librespot/workflows/build/badge.svg)](https://github.com/librespot-org/librespot/actions)
 [![Gitter chat](https://badges.gitter.im/librespot-org/librespot.png)](https://gitter.im/librespot-org/spotify-connect-resources)
 [![Crates.io](https://img.shields.io/crates/v/librespot.svg)](https://crates.io/crates/librespot)
@@ -16,6 +27,151 @@ After installation, you can run librespot from the CLI using a command such as `
 
 ## This fork
 As the origin by [plietar](https://github.com/plietar/) is no longer actively maintained, this organisation and repository have been set up so that the project may be maintained and upgraded in the future.
+
+## Cinnamobot/librespot — the `fastpotify-automix` branch
+
+**This repository is a fork of
+[librespot-org/librespot](https://github.com/librespot-org/librespot).** The
+library, its crates, its audio backends, its documentation, and its release
+process are the upstream project's work. Where anything below looks like it
+describes librespot itself, the upstream README and wiki are the authority, and
+this file does not restate them.
+
+The branch `fastpotify-automix` carries what one client needs beyond the
+release, for **[Fastpotify](https://github.com/Cinnamobot/fastpotify)**'s
+automix: transitions between tracks that are planned rather than timed. It is
+not intended to be merged as a whole, and it does not change default
+behaviour — a host that never sets a crossfade plan gets exactly upstream
+playback.
+
+### What is not this fork's work
+
+The base crossfade is a **cherry-pick of
+[librespot-org/librespot#1756](https://github.com/librespot-org/librespot/pull/1756)**,
+"feat(playback): crossfade between tracks" by
+[@revolutionxk](https://github.com/revolutionxk), which is still open upstream.
+That PR is where the second decoder, the equal-power ramp, the mixing before
+the sink, and `PlayerConfig::crossfade` come from; this branch only replayed it
+onto the fork's own changes. **It remains the right place to discuss that
+mechanism**, and this fork's commits should not be read as a competing
+implementation of it.
+
+Everything the branch adds on top — planning the overlap, matching tempo,
+choosing where each track enters and leaves, the events a host needs to drive
+that — is described below.
+
+### What the branch adds
+
+**A planned overlap.** Upstream fades on a timer, between two tracks that are
+otherwise unrelated. `CrossfadePlan` lets a host say where the outgoing track
+should start leaving, how long the overlap runs, and where in the incoming
+track it should begin. The player fires the overlap on that timing.
+
+```rust
+pub struct CrossfadePlan {
+    pub duration: Duration,             // overlap length
+    pub fade_out_before_end: Duration,  // where the exit starts
+    pub fade_in_at: Duration,           // where the incoming track starts
+    pub tempo_rate: f64,                // the pair's tempo ratio, pitch held
+    pub curve: Option<Arc<IncomingCurve>>,
+    pub incoming_track: Option<SpotifyUri>,
+}
+```
+
+`incoming_track` names the track the plan is a transition *into*. A plan
+outlives the moment it was made for — it is held while the previous track
+plays, and can be replaced or overtaken — so anything acting on it has to be
+able to tell whether it is still the plan for the boundary at hand. That
+matters most for a manual skip: the position a plan carries is a position in
+one particular track, and seeking a different track to it would land nowhere
+near the music.
+
+**Tempo matching, pitch held.** The outgoing tail can be keylocked to the
+incoming track's tempo, and the two decks can *share* the stretch rather than
+one carrying all of it — a pair 26% apart would otherwise be swept 26% on a
+single deck, past the point where keylock stays fully pitch-correct. The
+incoming deck's half is rendered ahead of the boundary and played as a curve,
+rather than run live: a deck fed whole packets while it consumes them at a
+swept rate either underruns or runs its decoder ahead of what has been heard.
+
+**A bass handover.** Two tracks overlapping share their bass, and bass is where
+the mud is. A shelf at 200 Hz moves the low end from one deck to the other
+across the overlap, so only one of them owns it at a time.
+
+**Events a host needs before the preload.**
+
+- `PlayerEvent::UpcomingTrack` — the track that will play next, raised as soon
+  as the queue knows one. `TimeToPreloadNextTrack` cannot serve this: it fires
+  once the current track is nearly over, because it exists to have the *audio*
+  ready in time, whereas a host that wants to look something up about the next
+  track needs only its identity, and can have it much earlier.
+- `PlayerEvent::IncomingPreloaded` — a short probe of the incoming track's
+  audio. Only the outgoing track reaches the sink, so this is how a host gets a
+  grid for a track that never plays through the mixer.
+
+**A probe that cannot stall playback.** The probe runs on the same thread as
+the loop that feeds the sink, and `AudioFileStreaming::read` blocks on a
+condition variable until the bytes it was asked for have arrived. A step taken
+before the fetch had caught up therefore stalled the playing track for as long
+as the CDN took — measured at a median of 137 ms and a worst case of seconds,
+against a sink holding a fraction of that. `StreamLoaderController::read_is_ready`
+lets the step be deferred instead.
+
+**A preload ask that can be repeated.** `TimeToPreloadNextTrack` is raised once
+per track, and answered with whatever the queue holds at that instant. A track
+started from a single-track context is the case that goes wrong: the queue is
+still empty when the ask goes out and is filled a moment later, so the ask is
+spent with nothing to preload. The ask is now repeated while nothing arrives,
+bounded so an empty queue does not produce a command every couple of seconds
+for the life of a track.
+
+**Fixes found by running it for hours.** An audio output device that goes away
+— an unplugged headset, a machine waking from sleep — pauses the player, which
+the state machine read as a broken state and answered with `exit(1)`. A
+`spotify:delimiter` marker at the head of the queue was taken for the next
+track, so a preload ask was answered with a URI nothing can be loaded from and
+the boundary arrived with nothing to mix in.
+
+### Using it
+
+Every librespot crate must come from this branch, so one copy exists:
+
+```toml
+[patch.crates-io]
+librespot-audio    = { git = "https://github.com/Cinnamobot/librespot", branch = "fastpotify-automix" }
+librespot-connect  = { git = "https://github.com/Cinnamobot/librespot", branch = "fastpotify-automix" }
+librespot-core     = { git = "https://github.com/Cinnamobot/librespot", branch = "fastpotify-automix" }
+librespot-metadata = { git = "https://github.com/Cinnamobot/librespot", branch = "fastpotify-automix" }
+librespot-oauth    = { git = "https://github.com/Cinnamobot/librespot", branch = "fastpotify-automix" }
+librespot-playback = { git = "https://github.com/Cinnamobot/librespot", branch = "fastpotify-automix" }
+librespot-protocol = { git = "https://github.com/Cinnamobot/librespot", branch = "fastpotify-automix" }
+```
+
+`Cargo.lock` pins the revision, so the resolution is reproducible.
+
+**The quality workflow does not run on this branch** — upstream's `quality.yml`
+and `build.yml` trigger on `dev` and `master` only. Before pushing a change
+here, run what those jobs would:
+
+```shell
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+### Where the changes are
+
+| Crate | What it holds |
+|---|---|
+| `playback/src/player.rs` | `CrossfadePlan`, the deck, the stretch and bass handover, the probe, the events |
+| `audio/src/fetch/mod.rs` | `read_is_ready`, so a probe step can be deferred |
+| `connect/src/spirc.rs` | Raises `UpcomingTrack` when the queue moves |
+| `connect/src/state/tracks.rs` | Names the next *playable* track, skipping the queue's delimiter |
+| `protocol/build.rs` | Compiles `cuepoints.proto`, the automix cuepoints the client reads |
+
+Changes are kept as separate commits with their measurements, so any one of
+them can be dropped or sent upstream on its own. Patches upstream takes should
+be dropped from this branch as they land.
 
 # Documentation
 Documentation is currently a work in progress, contributions are welcome!
