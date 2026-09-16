@@ -357,14 +357,37 @@ impl<'ct> ConnectState {
         Ok(())
     }
 
+    /// The track the queue will play next, if it names one.
+    ///
+    /// The queue's head is not always a track. Crossing from a context into
+    /// the autoplay station — which is what starting a track on its own does
+    /// — moves the station's delimiter to the head of `next_tracks`, and it
+    /// sits there until the next track is set. Taking the head at face value
+    /// then answered the preload ask with `spotify:delimiter`, which is not a
+    /// URI anything can be loaded from, so the ask was spent and nothing was
+    /// preloaded: the boundary arrived with nothing to mix in and the
+    /// transition was lost. Measured in that state, the ask went unanswered
+    /// nine times while 51 real tracks sat behind the marker.
     pub fn preview_next_track(&mut self) -> Option<SpotifyUri> {
-        let next = if self.repeat_track() {
-            self.current_track(|t| &t.uri)
-        } else {
-            &self.next_tracks().first()?.uri
-        };
+        if self.repeat_track() {
+            let uri = self.current_track(|t| t.uri.clone());
+            return SpotifyUri::from_uri(&uri).ok();
+        }
+        let uri = next_playable(&self.next_tracks())?;
+        SpotifyUri::from_uri(uri).ok()
+    }
 
-        SpotifyUri::from_uri(next).ok()
+    /// The queue's first next-track URI as it is stored, and how many the
+    /// queue holds.
+    ///
+    /// Read when a preload ask cannot be answered: `preview_next_track` folds
+    /// a URI that will not parse into the same `None` as an empty queue, so
+    /// the raw string is what tells those apart.
+    pub fn next_track_probe(&self) -> (usize, Option<String>) {
+        (
+            self.next_tracks().len(),
+            self.next_tracks().first().map(|t| t.uri.clone()),
+        )
     }
 
     pub fn has_next_tracks(&self, min: Option<usize>) -> bool {
@@ -440,5 +463,66 @@ impl<'ct> ConnectState {
             self.update_queue_revision();
         }
         self.update_restrictions();
+    }
+}
+
+/// The first track in `tracks` that is a track, rather than a marker.
+///
+/// `next_tracks` holds a delimiter at its head while a context hands over to
+/// the autoplay station, so the first entry is not always something that can
+/// be loaded.
+fn next_playable(tracks: &[ProvidedTrack]) -> Option<&str> {
+    tracks
+        .iter()
+        .find(|track| !track.uid.starts_with(IDENTIFIER_DELIMITER))
+        .map(|track| track.uri.as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track(uri: &str, uid: &str) -> ProvidedTrack {
+        ProvidedTrack {
+            uri: uri.to_string(),
+            uid: uid.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// The bug this covers: a preload ask was answered with the delimiter,
+    /// which is not a URI anything can be loaded from, so the ask was spent
+    /// and the transition had nothing to mix in. Measured with the marker at
+    /// the head of a 51-track queue, the ask went unanswered nine times.
+    #[test]
+    fn a_delimiter_at_the_head_is_not_the_next_track() {
+        let queued = vec![
+            track("spotify:delimiter", "delimiter1"),
+            track("spotify:track:first", "first"),
+            track("spotify:track:second", "second"),
+        ];
+        assert_eq!(next_playable(&queued), Some("spotify:track:first"));
+    }
+
+    /// With no marker in the way the head is the next track, which is the
+    /// ordinary case and must not change.
+    #[test]
+    fn an_ordinary_queue_names_its_head() {
+        let queued = vec![
+            track("spotify:track:first", "first"),
+            track("spotify:track:second", "second"),
+        ];
+        assert_eq!(next_playable(&queued), Some("spotify:track:first"));
+    }
+
+    /// Nothing to load is still nothing: an empty queue, and one that holds
+    /// only markers, both name no track.
+    #[test]
+    fn a_queue_with_no_track_names_none() {
+        assert_eq!(next_playable(&[]), None);
+        assert_eq!(
+            next_playable(&[track("spotify:delimiter", "delimiter1")]),
+            None
+        );
     }
 }
