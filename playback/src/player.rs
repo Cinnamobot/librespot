@@ -1534,9 +1534,24 @@ enum PlayerPreload {
     },
 }
 
-/// Samples the probe reads per step. Small enough that a step is far
-/// shorter than the sink's queue, so the playing track is never starved.
-const PROBE_STEP_SAMPLES: usize = 16_384 * NUM_CHANNELS as usize;
+/// Frames the probe reads per step.
+///
+/// A cap, not a guarantee: `next_packet` returns whole packets, so a step
+/// overshoots this by up to one packet. What actually keeps a step from
+/// stalling the sink is that it is not taken at all until the bytes it needs
+/// have arrived — see the `read_is_ready` check at the call site. This only
+/// bounds how much of the probe a single pass can get through, which keeps the
+/// playing track's own decode from waiting behind a long run of packets.
+const PROBE_STEP_SAMPLES: usize = 4_096 * NUM_CHANNELS as usize;
+
+/// Bytes a probe step may read without waiting.
+///
+/// A packet is read whole, and Vorbis packets are not a fixed size, so this is
+/// the extent the step is cleared to touch rather than a length it is held to.
+/// It only has to be large enough that a step is not refused for a packet that
+/// was in fact already fetched, and small enough that waiting for it costs the
+/// playing track nothing.
+const PROBE_STEP_READ_BYTES: usize = 8 * 1024;
 
 type Decoder = Box<dyn AudioDecoder + Send>;
 
@@ -2427,7 +2442,25 @@ impl Future for PlayerInternal {
                 else {
                     unreachable!("just matched");
                 };
-                if probe_step(&mut loaded_track.decoder, &mut samples) {
+                // A step is skipped outright while the loader has not yet
+                // fetched what the next packet will need. `probe_step` reads
+                // straight through `AudioFileStreaming::read`, which blocks on
+                // a condition variable until the bytes arrive, so stepping
+                // here before they have would stall the loop that feeds the
+                // sink — which is the gap this whole design exists to avoid.
+                // Waiting costs nothing: the playing track is decoded on this
+                // same pass either way.
+                if !loaded_track
+                    .stream_loader_controller
+                    .read_is_ready(PROBE_STEP_READ_BYTES)
+                {
+                    self.preload = PlayerPreload::Probing {
+                        track_id,
+                        loaded_track,
+                        samples,
+                        position_ms,
+                    };
+                } else if probe_step(&mut loaded_track.decoder, &mut samples) {
                     self.preload = PlayerPreload::Probing {
                         track_id,
                         loaded_track,
