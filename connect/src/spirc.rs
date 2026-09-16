@@ -710,6 +710,15 @@ impl SpircTask {
         if let PlayerEvent::TrackChanged { audio_item } = event {
             self.connect_state.update_duration(audio_item.duration_ms);
             self.update_state = true;
+            // The queue's own idea of what follows: `preview_next_track` is
+            // the same call the preload makes, so a host told this names the
+            // track that will actually be loaded next. A host that wants to
+            // look something up about it — the automix cuepoints, say — can
+            // do so now, instead of waiting for the preload to decide, which
+            // is held back until the current track is nearly over.
+            if let Some(next) = self.connect_state.preview_next_track() {
+                self.player.emit_upcoming_track_event(next);
+            }
             return Ok(());
         }
 
