@@ -861,6 +861,7 @@ enum PlayerCommand {
     AddEventSender(mpsc::UnboundedSender<PlayerEvent>),
     SetSinkEventCallback(Option<SinkEventCallback>),
     EmitVolumeChangedEvent(u16),
+    EmitUpcomingTrackEvent(SpotifyUri),
     SetAutoNormaliseAsAlbum(bool),
     SetCrossfade(Duration),
     SetCrossfadePlan(Option<CrossfadePlan>),
@@ -978,6 +979,17 @@ pub enum PlayerEvent {
     },
     TrackChanged {
         audio_item: Box<AudioItem>,
+    },
+    /// The track that would play next, as soon as the queue knows one.
+    ///
+    /// Sent when a context is loaded and when the queue moves, which is well
+    /// before [`PlayerEvent::TimeToPreloadNextTrack`] — that one only fires
+    /// once the current track is nearly over, because it exists to have the
+    /// *audio* ready in time. A host that wants to look something up about
+    /// the next track needs only its identity, and can have it from the
+    /// moment the queue is known.
+    UpcomingTrack {
+        track_id: SpotifyUri,
     },
     SessionConnected {
         connection_id: String,
@@ -1367,6 +1379,12 @@ impl Player {
 
     pub fn emit_volume_changed_event(&self, volume: u16) {
         self.command(PlayerCommand::EmitVolumeChangedEvent(volume));
+    }
+
+    /// Announces the track that would play next, for a host that wants to
+    /// look it up before the preload gets to it.
+    pub fn emit_upcoming_track_event(&self, track_id: SpotifyUri) {
+        self.command(PlayerCommand::EmitUpcomingTrackEvent(track_id));
     }
 
     pub fn set_auto_normalise_as_album(&self, setting: bool) {
@@ -3663,6 +3681,9 @@ impl PlayerInternal {
             PlayerCommand::EmitVolumeChangedEvent(volume) => {
                 self.send_event(PlayerEvent::VolumeChanged { volume })
             }
+            PlayerCommand::EmitUpcomingTrackEvent(track_id) => {
+                self.send_event(PlayerEvent::UpcomingTrack { track_id })
+            }
 
             PlayerCommand::EmitRepeatChangedEvent { context, track } => {
                 self.send_event(PlayerEvent::RepeatChanged { context, track })
@@ -3865,6 +3886,10 @@ impl fmt::Debug for PlayerCommand {
             PlayerCommand::EmitVolumeChangedEvent(volume) => f
                 .debug_tuple("EmitVolumeChangedEvent")
                 .field(&volume)
+                .finish(),
+            PlayerCommand::EmitUpcomingTrackEvent(track_id) => f
+                .debug_tuple("EmitUpcomingTrackEvent")
+                .field(track_id)
                 .finish(),
             PlayerCommand::SetAutoNormaliseAsAlbum(setting) => f
                 .debug_tuple("SetAutoNormaliseAsAlbum")
