@@ -2658,9 +2658,19 @@ impl Future for PlayerInternal {
                             })
                         }
                     }
-                } else {
+                } else if matches!(self.state, PlayerState::Invalid) {
                     error!("PlayerInternal poll: Invalid PlayerState");
                     exit(1);
+                } else {
+                    // The state stopped being `Playing` while this pass was
+                    // running, which is what `ensure_sink_running` does when
+                    // the sink will not start: it pauses the player. That is
+                    // an audio output device having gone away, not a broken
+                    // state machine — the sink has already told the host to
+                    // connect one and press play — so the process must
+                    // survive it. Ending here meant an unplugged headset or a
+                    // machine waking from sleep killed the whole application.
+                    debug!("the sink could not start; the player is paused until it can");
                 };
             } else if self.outgoing.is_some() {
                 self.ensure_sink_running();
