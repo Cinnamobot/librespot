@@ -53,6 +53,28 @@ const PRELOAD_NEXT_TRACK_BEFORE_END_DURATION_MS: u32 = 30000;
 /// after the overlap has begun is of no use.
 const CROSSFADE_PRELOAD_SLACK: Duration = Duration::from_secs(20);
 
+/// How long to wait before asking again for a next track the queue did not
+/// have yet.
+///
+/// `TimeToPreloadNextTrack` is raised once per track, and the host answers it
+/// with whatever the queue holds at that instant. A track started from a
+/// single-track context is the case that goes wrong: the queue is still empty
+/// when the ask goes out and is filled in a moment later — measurably, the
+/// autoplay context landed in the same second as the ask, after it — so the
+/// host has nothing to preload, and because the ask was already spent the
+/// boundary arrives with nothing to mix in and the transition is lost.
+///
+/// Long enough not to spin on a queue that stays empty, short enough to leave
+/// the preload time to land before the overlap.
+const PRELOAD_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How many times a spent preload ask is repeated while nothing arrives.
+///
+/// Bounded because the host may legitimately have nothing: the last track of
+/// a context has no next, and repeating an ask for it forever would be a
+/// command every couple of seconds for the life of the track.
+const PRELOAD_RETRIES: u32 = 8;
+
 const CROSSFADE_MAX: Duration = Duration::from_secs(12);
 
 /// Smallest tempo difference worth keylocking. Below it the two grids stay
@@ -854,6 +876,14 @@ struct PlayerInternal {
 
     crossfade: Duration,
     plan: Option<CrossfadePlan>,
+    /// What `maybe_begin_crossfade` last said it was waiting for, so a poll
+    /// that repeats the same answer does not repeat the line. Cleared when a
+    /// transition fires.
+    waiting_logged: Option<&'static str>,
+    /// When the current track's preload ask was raised, and how many times it
+    /// has been repeated since nothing came of it. `None` before the ask.
+    preload_asked: Option<Instant>,
+    preload_retries: u32,
     outgoing: Option<Outgoing>,
     /// The ratio the outgoing tail is being swept towards, when this
     /// transition shares its stretch between the decks. `None` means the tail
@@ -1310,6 +1340,9 @@ impl Player {
 
                 crossfade: crossfade.min(CROSSFADE_MAX),
                 plan: None,
+                waiting_logged: None,
+                preload_asked: None,
+                preload_retries: 0,
                 outgoing: None,
                 outgoing_sweep: None,
                 fade_in: None,
@@ -2692,6 +2725,16 @@ impl Future for PlayerInternal {
                 .plan
                 .as_ref()
                 .map(|plan| plan.fade_out_before_end.max(plan.duration));
+            // Read here rather than below, where the state is borrowed
+            // mutably and the plan is out of reach.
+            let plan_description = match &self.plan {
+                Some(plan) => format!(
+                    "fade_out_before_end {:.2}s, duration {:.2}s",
+                    plan.fade_out_before_end.as_secs_f64(),
+                    plan.duration.as_secs_f64()
+                ),
+                None => "none".into(),
+            };
             let crossfade_lead_ms = match (planned_lead, self.crossfade().is_zero()) {
                 (Some(lead), _) => (lead + CROSSFADE_PRELOAD_SLACK).as_millis() as i64,
                 (None, true) => 0,
@@ -2737,8 +2780,49 @@ impl Future for PlayerInternal {
                     remaining_ms < crossfade_lead_ms
                 };
 
+                // The one decision the whole transition depends on: without it
+                // the preload never happens, the incoming deck is never
+                // probed, and the boundary has nothing to mix in. Logged when
+                // it first becomes true, so one line per track rather than one
+                // per poll, and the numbers say which side of the test failed.
+                if wants_preload && !*suggested_to_preload_next_track {
+                    debug!(
+                        "crossfade: preload wanted, remaining {:.2}s, lead {:.2}s, plan {}",
+                        remaining_ms as f64 / 1000.0,
+                        crossfade_lead_ms as f64 / 1000.0,
+                        plan_description
+                    );
+                }
                 if !*suggested_to_preload_next_track && wants_preload {
                     *suggested_to_preload_next_track = true;
+                    self.preload_asked = Some(Instant::now());
+                    self.preload_retries = 0;
+                    self.send_event(PlayerEvent::TimeToPreloadNextTrack {
+                        track_id,
+                        play_request_id,
+                    });
+                } else if *suggested_to_preload_next_track
+                    && wants_preload
+                    && matches!(self.preload, PlayerPreload::None)
+                    && self.preload_retries < PRELOAD_RETRIES
+                    && self
+                        .preload_asked
+                        .is_some_and(|at| at.elapsed() >= PRELOAD_RETRY_INTERVAL)
+                {
+                    // The ask was raised and nothing came of it. The usual
+                    // reason is that the host had no next track to give at
+                    // that instant — a queue that was still being filled —
+                    // and since the ask happens once per track, waiting for
+                    // the boundary is the only other option. Asking again is
+                    // cheap: the host answers with what the queue holds now.
+                    self.preload_asked = Some(Instant::now());
+                    self.preload_retries += 1;
+                    debug!(
+                        "crossfade: nothing was preloaded after the ask; asking again \
+                         ({} of {PRELOAD_RETRIES}), remaining {:.2}s",
+                        self.preload_retries,
+                        remaining_ms as f64 / 1000.0
+                    );
                     self.send_event(PlayerEvent::TimeToPreloadNextTrack {
                         track_id,
                         play_request_id,
@@ -3063,13 +3147,37 @@ impl PlayerInternal {
         };
         let ready = matches!(self.preload, PlayerPreload::Ready { .. });
         if remaining > start_within || !ready {
-            debug!(
-                "crossfade: waiting, remaining {:.2}s, start within {:.2}s, preload ready {ready}",
-                remaining.as_secs_f64(),
-                start_within.as_secs_f64()
-            );
+            // Both halves can be true at once — right after a track starts,
+            // nothing has asked for a preload yet *and* the boundary is far
+            // off — so the label names the one that is actually holding the
+            // transition back. Reporting "not ready" for a track whose
+            // preload has not been asked for yet read as a fault when it was
+            // simply early.
+            let waiting_for = if remaining > start_within {
+                "the boundary is not in view yet"
+            } else {
+                "preload never became ready"
+            };
+            if self.waiting_logged != Some(waiting_for) {
+                self.waiting_logged = Some(waiting_for);
+                debug!(
+                    "crossfade: waiting for {waiting_for}; remaining {:.2}s, start within {:.2}s, \
+                     preload ready {ready}, plan {}",
+                    remaining.as_secs_f64(),
+                    start_within.as_secs_f64(),
+                    match &self.plan {
+                        Some(plan) => format!(
+                            "exit in {:.2}s, overlap {:.2}s",
+                            plan.fade_out_before_end.as_secs_f64(),
+                            plan.duration.as_secs_f64()
+                        ),
+                        None => "none".into(),
+                    }
+                );
+            }
             return;
         }
+        self.waiting_logged = None;
         let rate = self.plan.as_ref().map_or(1.0, |plan| plan.tempo_rate);
         debug!(
             "crossfade: firing with {:.2}s overlap, outgoing tail at {rate:.4}x",

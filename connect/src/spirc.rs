@@ -1593,7 +1593,15 @@ impl SpircTask {
         }
 
         if let Some(track_id) = self.connect_state.preview_next_track() {
+            debug!("preload: the queue answers with {track_id}");
             self.player.preload(track_id);
+        } else {
+            // The ask is spent once per track, so a host that cannot answer
+            // it leaves the boundary with nothing to mix in. Saying so is the
+            // only way to tell "the queue is empty" apart from "the ask never
+            // reached the host", which otherwise look identical from a log.
+            let (queued, first) = self.connect_state.next_track_probe();
+            debug!("preload: the queue has nothing for the ask ({queued} next track(s), first {first:?})");
         }
     }
 
